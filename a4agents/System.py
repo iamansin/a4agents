@@ -1,7 +1,7 @@
 import ray
 from ray.dag import InputNode
 from typing import Callable, Dict, Any, Union, Optional
-from a4agents.SystemNode import SystemNode
+from a4agents.System_Utils import SystemNode, Router
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -17,9 +17,10 @@ class System:
     def __init__(self, name: str):
         self.name = name
         self.nodes = {}  # Stores agent nodes
-        self.dag = None  # Stores DAG workflow
+        self.dag = None  # Stores DAG workflowd
+        self.Router =  Router(f"{name}_router")
     
-    def node(self, func: Optional[Callable] = None, *, name: Optional[str] = None, resources: Optional[Dict[str, Any]] = None):
+    def node(self, func: Optional[Callable] = None, name: Optional[str] = None, resources: Optional[Dict[str, Any]] = None):
         """
         Registers a function as a SystemNode in the Ray DAG, supporting both decorator and direct function call.
 
@@ -66,7 +67,7 @@ class System:
 
         return decorator
 
-    def add_nodes_from_dict(self, func_dict: Dict[str, Callable], resources: Optional[Dict[str, Any]] = None):
+    def nodes_from_dict(self, func_dict: Dict[str, Callable], resources: Optional[Dict[str, Any]] = None):
         """
         Adds multiple functions as SystemNodes from a dictionary.
         
@@ -100,7 +101,13 @@ class System:
                 logger.error(f"Error adding node '{name}': {str(e)}")
                 raise
 
-
+    def add_routes(self, from_node: str, mapping_dict: Optional[Dict[str, str]] = None, to_node: Optional[str] = None):
+        """Adds routes through the system's Router. Handles system-level errors."""
+        try:
+            self.Router.add_routes(from_node, to_node, mapping_dict)
+        except ValueError as e:
+            raise # Re-raise the exception for higher-level handling.
+        
     def workflow(self, workflow: Dict[str, list]):
         """
         Defines execution order in the system's DAG.
