@@ -1,8 +1,11 @@
 import ray
-from ray.dag import InputNode
-from typing import Callable, Dict, Any, Union, Optional
-from a4agents.System_Utils import SystemNode, Router
+from typing import Callable, Dict, Any, Union, Optional, Tuple, List, Literal
+from a4agents.System_Utils import SystemNode
+import base64
 import logging
+import networkx as nx
+import weakref
+from IPython.display import Image, display
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -16,9 +19,9 @@ class System:
     
     def __init__(self, name: str):
         self.name = name
-        self.nodes = {}  # Stores agent nodes
-        self.dag = None  # Stores DAG workflowd
-        self.Router =  Router(f"{name}_router")
+        self._nodes = {}  # Stores agent nodes
+        self.dag = None  
+        self._workflow = WorkflowConstructure(self)
     
     def node(self, func: Optional[Callable] = None, name: Optional[str] = None, resources: Optional[Dict[str, Any]] = None):
         """
@@ -42,15 +45,16 @@ class System:
             if not isinstance(name, str) or not name.strip():
                 raise ValueError("Node name must be a non-empty string.")
 
-            if name in self.nodes:
+            if name in self._nodes:
                 raise ValueError(f"Node name '{name}' already exists in system '{self.name}'.")
 
-            if any(node.func == func for node in self.nodes.values()):
+            if any(node.func == func for node in self._nodes.values()):
                 raise ValueError(f"Function '{func.__name__}' is already registered under a different name.")
 
             try:
                 node = SystemNode(func, name, resources)
-                self.nodes[name] = node
+                self._nodes[name] = node
+                self._workflow.add_node(node) # Add node to the workflow graph
                 logger.info(f"Node '{name}' added to System '{self.name}'.")
                 return node
             except Exception as e:
@@ -67,7 +71,7 @@ class System:
 
         return decorator
 
-    def nodes_from_dict(self, func_dict: Dict[str, Callable], resources: Optional[Dict[str, Any]] = None):
+    def nodes_from_dict(self, func_dict: Dict[str, Tuple[Callable, Optional[Dict[str, Any]]]]):
         """
         Adds multiple functions as SystemNodes from a dictionary.
         
@@ -79,34 +83,33 @@ class System:
         if not isinstance(func_dict, dict):
             raise TypeError("Expected a dictionary with {name: function} mapping, but got {type(func_dict).__name__}")
 
-        for name, func in func_dict.items():
-            if not isinstance(name, str) or not name.strip():
-                logger.error(f"Invalid node name '{name}'. It must be a non-empty string.")
-                raise TypeError(f"Node name '{name}' must be a non-empty string.")
-
-            if not callable(func):
-                logger.error(f"Invalid function '{name}': Expected a callable, but got {type(func).__name__}.")
-                raise TypeError(f"Function '{name}' must be a callable function.")
-
-            if name in self.nodes:
-                logger.error(f"Duplicate node name '{name}'. Node names must be unique in system '{self.name}'.")
-                raise ValueError(f"Node name '{name}' already exists in system '{self.name}'.")
-
+        for name, args in func_dict.items():
+            
             try:
-                # Create and register the node
-                node = SystemNode(func, name, resources)
-                self.nodes[name] = node
-                logger.info(f"Node '{name}' successfully added to System '{self.name}'.")
+                self.node( func= args[0], name = name, resources= args[1])
             except Exception as e:
                 logger.error(f"Error adding node '{name}': {str(e)}")
                 raise
 
-    def add_routes(self, from_node: str, mapping_dict: Optional[Dict[str, str]] = None, to_node: Optional[str] = None):
+    def add_route(self, from_node: str, to_node: Optional[str] = None):
         """Adds routes through the system's Router. Handles system-level errors."""
+        
+        if to_node:
+            try:
+                self._workflow.add_edges(from_node, to_node)
+                logger.info(f"Added direct route from '{from_node}' to '{to_node}'.")
+            except Exception as e:
+                logger.error(f"Error adding direct route from '{from_node}' to '{to_node}': {str(e)}")
+                raise
+    
+    def add_conditional_route(self, from_node: str, mapping_dict: Dict[str, str]):
+        """Adds conditional routes through the system's Router. Handles system-level errors."""
         try:
-            self.Router.add_routes(from_node, to_node, mapping_dict)
-        except ValueError as e:
-            raise # Re-raise the exception for higher-level handling.
+            self._workflow.conditional_edges(from_node, mapping_dict)
+            logger.info(f"Added conditional route from '{from_node}' to '{mapping_dict}'.")
+        except Exception as e:
+            logger.error(f"Error adding conditional route from '{from_node}' to '{mapping_dict}': {str(e)}")
+            raise
         
     def workflow(self, workflow: Dict[str, list]):
         """
@@ -117,20 +120,18 @@ class System:
         """
         try:
             dag = {}
-            input_node = InputNode()
-
             for parent, children in workflow.items():
-                if parent not in self.nodes:
+                if parent not in self._nodes:
                     raise ValueError(f"Node '{parent}' not registered in the system.")
 
-                parent_node = self.nodes[parent]
+                parent_node = self._nodes[parent]
 
                 for child in children:
-                    if child not in self.nodes:
+                    if child not in self._nodes:
                         raise ValueError(f"Node '{child}' not registered in the system.")
                     
-                    child_node = self.nodes[child]
-                    dag[child] = child_node.bind(parent_node.bind(input_node))
+                    child_node = self._nodes[child]
+                    dag[child] = child_node.bind(parent_node.bind)
 
             self.dag = dag
         except Exception as e:
@@ -157,3 +158,122 @@ class System:
             return ray.get(self.dag[start_node].execute(data))
         except Exception as e:
             raise RuntimeError(f"Error executing DAG from '{start_node}': {e}")
+
+    def draw_graph(self) -> None:
+        """Display the mermaid diagram using mermaid.ink with error handling."""
+        
+        def generate_mermaid() -> str:
+            """Generate the mermaid.js diagram string with proper error handling."""
+            if not self._nodes:
+                raise RuntimeError("Cannot generate a Mermaid diagram without any nodes.")
+            
+            graph = self._workflow._graph
+            mermaid_string = "graph TD\n"
+
+            shape_map = {
+                "rectangle": '[\"{label}\"]',
+                "diamond": '{{\"{label}\"}}',
+                "circle": '(\"{label}\")'
+            }
+            # !!!!!!!! This code needs proper attentions as self._nodes does not unpack as set of 3..
+            for node_id, label, shape in self._nodes:
+                mermaid_string += f"    {node_id}{shape_map[shape].format(label=label)}\n"
+
+            # Add edges with labels and conditional styles
+            for from_node, to_node in graph.edges:
+                edge_style = "-->" if graph[from_node][to_node]["type"] == "Direct" else "-.->"
+                edge_label_str = f"|{label}|" if label else ""
+                mermaid_string += f"    {from_node} {edge_style} {edge_label_str} {to_node}\n"
+
+            return mermaid_string.strip()
+        try:
+            mermaid_string = generate_mermaid()
+            base64_string = base64.urlsafe_b64encode(mermaid_string.encode("utf8")).decode("ascii")
+            mermaid_url = "https://mermaid.ink/img/" + base64_string
+
+            print("Generated Mermaid Code:\n", mermaid_string, "\n")
+            display(Image(url=mermaid_url))
+        except Exception as e:
+            print(f"Error while generating Mermaid diagram: {e}")
+            
+            
+
+class WorkflowConstructure:
+    def __init__(self, system_reference):
+        self._system = weakref.ref(system_reference) 
+        self._graph = nx.DiGraph()
+        self._mapping_dict = {}
+        
+    def add_node(self, node: SystemNode):
+        """
+        Adds a node to the workflow graph.
+
+        Args:
+            node_name (str): The name of the node.
+            node_type (str): The type of the node.
+            resources (Optional[Dict[str, Any]]): Resource allocation for the node.
+
+        Raises:
+            ValueError: If the node already exists in the graph.
+        """
+        name = node.name
+        self._graph.add_node(name, func_ref = node.task, resources= node.resources)
+        logger.info(f"Node '{name}' added to the workflow graph.")
+        
+    def add_edges(self, from_node: str, to_node: str):
+        """
+        Adds a direct edge between two nodes.
+        
+        Args:
+            from_node (str): Starting node.
+            to_node (str): Target node.
+        
+        Raises:
+            ValueError: If the edge already exists or nodes are missing.
+        """
+        if from_node not in self._system._nodes:
+            raise ValueError(f"Source Node: {from_node} does not found in Graph.")
+        
+        if to_node not in self._system._nodes:
+            raise ValueError(f"Target Node: {to_node} does not found in Graph.")
+
+        if to_node in self._graph.successors(from_node):
+            raise ValueError(f"Route from '{from_node}' to '{to_node}' already exists.")
+        
+        try:
+            self._graph.add_edge(from_node, to_node, type="Direct")
+        
+        except Exception as e:
+            raise
+        
+    def conditional_edges(self, from_node :str , mapping : Dict[str,str]):
+        """
+        Adds conditional edges where the transition depends on the output value.
+        
+        Args:
+            from_node (str): The node from which transitions occur.
+            mapping (Dict[str, str]): A dictionary mapping outputs to target nodes.
+        
+        Raises:
+            ValueError: If any target node does not exist or the edge already exists.
+        """
+        if from_node not in self._system._nodes:
+            raise ValueError(f"Source Node: {from_node}' does not found in Graph.")
+
+        existing_successors = set(self._graph.successors(from_node))
+
+        for return_value, to_node in mapping.items():
+            if to_node not in self._graph.nodes:
+                raise ValueError(f"Target node '{to_node}' does not exist.")
+
+            if to_node in existing_successors:
+                logger.warning(f"Edge from '{from_node}' to '{to_node}' already exists.")
+                continue  # Skip adding duplicate edges
+            
+            try:
+                self._graph.add_edge(from_node, to_node, type="Conditional", return_value=return_value)
+            
+            except Exception as e:
+                raise
+        
+        self._mapping_dict[from_node] = mapping
