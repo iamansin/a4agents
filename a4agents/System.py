@@ -20,9 +20,10 @@ class System:
     def __init__(self, name: str):
         self.name = name
         self._nodes = {}  # Stores agent nodes
-        self.dag = None  
+        self._dag = nx.DiGraph()  
         self._workflow = WorkflowConstructure(self)
-    
+        self._DAGExecutor = DAGExecuter(self)
+        
     def node(self, func: Optional[Callable] = None, name: Optional[str] = None, resources: Optional[Dict[str, Any]] = None):
         """
         Registers a function as a SystemNode in the Ray DAG, supporting both decorator and direct function call.
@@ -167,7 +168,7 @@ class System:
             if not self._nodes:
                 raise RuntimeError("Cannot generate a Mermaid diagram without any nodes.")
             
-            graph = self._workflow._graph
+            graph = self._dag
             mermaid_string = "graph TD\n"
 
             shape_map = {
@@ -176,32 +177,35 @@ class System:
                 "circle": '(\"{label}\")'
             }
             # !!!!!!!! This code needs proper attentions as self._nodes does not unpack as set of 3..
-            for node_id, label, shape in self._nodes:
-                mermaid_string += f"    {node_id}{shape_map[shape].format(label=label)}\n"
+            for node_name, node_attrs in graph.nodes(data=True):
+                shape = node_attrs.get("shape", "circle")  # Get shape, default to circle if not found
+                shape_str_mermaid = shape_map[shape].format(label=node_name)
+                mermaid_string += f"    {node_name}{shape_str_mermaid}\n"
 
             # Add edges with labels and conditional styles
-            for from_node, to_node in graph.edges:
-                edge_style = "-->" if graph[from_node][to_node]["type"] == "Direct" else "-.->"
-                edge_label_str = f"|{label}|" if label else ""
-                mermaid_string += f"    {from_node} {edge_style} {edge_label_str} {to_node}\n"
+            for edge in graph.edges:
+                from_node = edge[0]
+                to_node = edge[1]
+                label = graph[from_node][to_node]["type"]
+                edge_style = "-->" if label == "Direct" else "-.->"
+                mermaid_string += f"    {from_node} {edge_style}{to_node}\n"
 
             return mermaid_string.strip()
         try:
             mermaid_string = generate_mermaid()
             base64_string = base64.urlsafe_b64encode(mermaid_string.encode("utf8")).decode("ascii")
             mermaid_url = "https://mermaid.ink/img/" + base64_string
-
-            print("Generated Mermaid Code:\n", mermaid_string, "\n")
             display(Image(url=mermaid_url))
         except Exception as e:
-            print(f"Error while generating Mermaid diagram: {e}")
+          raise e
+          print(f"Error while generating Mermaid diagram: {e}")
             
             
 
 class WorkflowConstructure:
     def __init__(self, system_reference):
         self._system = weakref.ref(system_reference) 
-        self._graph = nx.DiGraph()
+        self._graph = self._system()._dag 
         self._mapping_dict = {}
         
     def add_node(self, node: SystemNode):
@@ -217,7 +221,8 @@ class WorkflowConstructure:
             ValueError: If the node already exists in the graph.
         """
         name = node.name
-        self._graph.add_node(name, func_ref = node.task, resources= node.resources)
+        sh = "rectangle" if node.is_tool else "circle"
+        self._graph.add_node(name, func_ref = node.task, resources= node.resources, shape = sh)
         logger.info(f"Node '{name}' added to the workflow graph.")
         
     def add_edges(self, from_node: str, to_node: str):
@@ -231,10 +236,10 @@ class WorkflowConstructure:
         Raises:
             ValueError: If the edge already exists or nodes are missing.
         """
-        if from_node not in self._system._nodes:
+        if from_node not in self._system()._nodes:
             raise ValueError(f"Source Node: {from_node} does not found in Graph.")
         
-        if to_node not in self._system._nodes:
+        if to_node not in self._system()._nodes:
             raise ValueError(f"Target Node: {to_node} does not found in Graph.")
 
         if to_node in self._graph.successors(from_node):
@@ -257,12 +262,13 @@ class WorkflowConstructure:
         Raises:
             ValueError: If any target node does not exist or the edge already exists.
         """
-        if from_node not in self._system._nodes:
+        if from_node not in self._system()._nodes:
             raise ValueError(f"Source Node: {from_node}' does not found in Graph.")
 
         existing_successors = set(self._graph.successors(from_node))
-
+  
         for return_value, to_node in mapping.items():
+  
             if to_node not in self._graph.nodes:
                 raise ValueError(f"Target node '{to_node}' does not exist.")
 
@@ -271,7 +277,7 @@ class WorkflowConstructure:
                 continue  # Skip adding duplicate edges
             
             try:
-                self._graph.add_edge(from_node, to_node, type="Conditional", return_value=return_value)
+                self._graph.add_edge(from_node, to_node, _from = from_node, _to = to_node, type="Conditional", return_value=return_value)
             
             except Exception as e:
                 raise
