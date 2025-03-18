@@ -1,0 +1,9 @@
+sys.node ->while creating a node in the system we should be -> remove function checking as user may wany to add the same function with different name. 
+sys.draw_graph() ->Make the Graph Representatino properly, Tools with different colors/shape and ray-tasks/actor into other color.
+In the ETool/EAgent class there should be a method that will simply run the tool some how, and if the tools/agents are http type then create a function that will do function calls.
+Also make the load_tool/load_agent method in the Registry class async so that we can asynchronously clone the agents and the tools.
+The agent/tool repo should have a YAML file named exactly same as the repo, not only this the YAML File should contain the json for the Base State(model that will be passed inside the langgraph)
+And every time we load any agent we firstly check for the YAML file if that is not there the agent/tool can not be used.
+There should be some mechansim to delete the downloaded agents/tools if they are not in the use.
+Cache the loaded_reference into some where and then if the system recompiled we use the same loaded references.
+If there is some changes we will realese the loaded_reference and then compile a new graph.

@@ -1,5 +1,5 @@
 ray
 langchain
 langchain_community
-ipython
-networkx
+numpy
+sentence_transformers
