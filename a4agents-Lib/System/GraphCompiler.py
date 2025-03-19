@@ -7,6 +7,7 @@ from langgraph.graph import StateGraph
 import logging
 from pathlib import Path
 from functools import partial
+from tqdm.asyncio import tqdm_asyncio
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -138,7 +139,7 @@ class DynamicGraphCompiler:
         # Run all loading tasks concurrently
         if tasks:
             logger.info(f"Concurrently loading {len(tasks)} tools and agents")
-            await asyncio.gather(*tasks)
+            await tqdm_asyncio.gather(*tasks)
         
         logger.info(f"Successfully loaded {len(self._resolved_nodes)} total nodes")
 
@@ -151,13 +152,7 @@ class DynamicGraphCompiler:
         """
         try:
             logger.info(f"Loading tool: {tool_name}")
-            # Note: If load_tool is a blocking operation, wrap it with run_in_executor
-            if inspect.iscoroutinefunction(self._registry.load_tool):
-                tool_obj = await self._registry.load_tool(tool_name)
-            else:
-                # Run blocking registry operations in a thread pool to avoid blocking the event loop
-                tool_obj = await asyncio.to_thread(self._registry.load_tool, tool_name)
-                
+            tool_obj = await self._registry.load_tool(tool_name)
             self._resolved_nodes[tool_name] = self._create_tool_function(tool_name, tool_obj)
             logger.debug(f"Successfully loaded tool: {tool_name}")
         except ValueError as e:
@@ -208,7 +203,7 @@ class DynamicGraphCompiler:
                 raise RuntimeError(f"Node execution failed: {node_name}") from e
                 
         # Set the function name for better debugging
-        node_wrapper.__name__ = f"{node_name}_wrapper"
+        node_wrapper.__name__ = f"_{node_name}_"
         return node_wrapper
     
     def _create_tool_function(self, tool_name: str, tool_obj: Any) -> Callable:
@@ -255,7 +250,7 @@ class DynamicGraphCompiler:
                 
         # Set the function name for better debugging
         if 'tool_wrapper' in locals():
-            tool_wrapper.__name__ = f"{tool_name}_wrapper"
+            tool_wrapper.__name__ = f"_{tool_name}_"
             return tool_wrapper
         else:
             raise ValueError(f"Could not create wrapper for tool: {tool_name}")

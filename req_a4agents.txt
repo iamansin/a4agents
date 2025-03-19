@@ -3,3 +3,6 @@ langchain
 langchain_community
 numpy
 sentence_transformers
+tqdm
+mcp
+aiohttp
