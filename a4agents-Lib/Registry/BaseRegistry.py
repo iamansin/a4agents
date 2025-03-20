@@ -1,3 +1,9 @@
+#Here we have to create our own Error class to manage the errors in the registry.
+#The Errors can be:
+#1. NO TRANSPORT file found
+#2. No command found in the configuration file
+#3. There was some problem while removing the agents/tools.
+
 import os
 import json
 import shutil
@@ -53,6 +59,7 @@ class ToolHandler:
     api_key: Optional[str] = None
     command: Optional[str] = None
     config_path: Optional[str] = None
+    dir : Optional[str] = None
     
     def __post_init__(self):
         """Validate the ToolHandler attributes after initialization."""
@@ -62,11 +69,11 @@ class ToolHandler:
         if not self.tool_type or not isinstance(self.tool_type, str):
             raise ValidationError("Tool type must be a non-empty string")
         
-        if self.tool_type == "remote" and not self.endpoint:
-            raise ValidationError("Remote tools must have an endpoint")
+        if self.tool_type == "MCP" and not self.endpoint:
+            raise ValidationError("MCP tool must have an endpoint")
             
-        if self.tool_type == "local" and not (self.command or self.config_path):
-            raise ValidationError("Local tools must have either a command or a config path")
+        if self.tool_type == "LOCAL" and not (self.command and self.config_path and self.dir):
+                raise ValidationError("Local tool must have command config path and directory path")
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert the ToolHandler instance to a dictionary."""
@@ -88,10 +95,10 @@ class AgentHandler:
     """
     name: str
     agent_type: str
-    repo_url: Optional[str] = None
     endpoint: Optional[str] = None
     command: Optional[str] = None
     config_path: Optional[str] = None
+    dir : Optional[str] = None
     
     def __post_init__(self):
         """Validate the AgentHandler attributes after initialization."""
@@ -101,14 +108,11 @@ class AgentHandler:
         if not self.agent_type or not isinstance(self.agent_type, str):
             raise ValidationError("Agent type must be a non-empty string")
         
-        if self.agent_type == "remote" and not self.endpoint:
-            raise ValidationError("Remote agents must have an endpoint")
-            
-        if self.agent_type == "github" and not self.repo_url:
-            raise ValidationError("GitHub agents must have a repository URL")
-            
-        if self.agent_type == "local" and not (self.command or self.config_path or self.repo_url):
-            raise ValidationError("Local agents must have either a command, config path, or repository URL")
+        if self.agent_type == "MCP" and not self.endpoint:
+            raise ValidationError("MCP Agent must have an endpoint")
+
+        if self.tool_type == "LOCAL" and not (self.command and self.config_path and self.dir):
+                raise ValidationError("Local Agent must have command config path and directory path")
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert the AgentHandler instance to a dictionary."""
@@ -226,11 +230,11 @@ class Registry:
                     await self._clone_repo_async(repo_url, repo_dir)
                     
                     # Find the config file in the cloned repository
-                    config_path = await self._find_config_file(name, repo_dir)
+                    config_path = await self._find_config_file(repo_dir)
                     if not config_path:
                         raise ValidationError(f"No TRANSPORT configuration file found for tool '{repo}'")
                     try:
-                        command = await self.extract_command(config_path)
+                        command = await self._extract_command(config_path)
                     except ValueError as e:
                         raise ValidationError(str(e))
             else:
@@ -243,7 +247,8 @@ class Registry:
                 endpoint=endpoint,
                 api_key=api_key,
                 command=command,
-                config_path=config_path
+                config_path=config_path,
+                dir = repo_dir
             )
             
             # Only lock when updating the registry
@@ -269,6 +274,110 @@ class Registry:
             else:
                 raise ValidationError(f"Failed to add tool '{name}': {str(e)}")
 
+    async def add_agent(self,
+                    name: str,
+                    agent_type: str,
+                    repo_url: Optional[str] = None,
+                    endpoint: Optional[str] = None,
+                    command: Optional[str] = None) -> AgentHandler:
+        """
+        Add an agent to the registry.
+        
+        Args:
+            name: Name of the agent
+            agent_type: Type of the agent (LOCAL, REMOTE, GITHUB)
+            repo_url: URL to the GitHub repository
+            endpoint: API endpoint for remote agents
+            command: Command to execute the agent
+            
+        Returns:
+            AgentHandler: The created agent handler
+            
+        Raises:
+            ValueError: If an agent with the same name already exists
+            ValidationError: If validation fails
+        """
+        # Check if agent already exists (quick non-locked check)
+        if not endpoint and not repo_url:
+            raise ValidationError("Agent must have either an endpoint or repository URL")
+        
+        if name in self.registry["agents"]:
+            raise ValueError(f"Agent '{name}' is already registered.")
+        
+        config_path = None
+        
+        try:
+            # Validate inputs based on agent type before acquiring any locks
+            if agent_type == "REMOTE":
+                if not endpoint:
+                    raise ValidationError("REMOTE agents must have an endpoint")
+                
+                # Validate the endpoint URL format and accessibility
+                await self._validate_endpoint(endpoint)
+                
+            elif agent_type == "LOCAL":
+                # Extract repo info (owner, repo) from URL
+                parsed_url = urlparse(repo_url)
+                path_parts = parsed_url.path.strip('/').split('/')
+                owner, repo = path_parts[0], path_parts[1]
+                repo_dir = os.path.join(AGENTS_DIR, repo)
+                
+                if repo_url and not command:
+                    # Check for YAML file existence without cloning the entire repository
+                    yaml_exists, _ = await self._check_yaml_file_exists(owner, repo)
+                    
+                    if not yaml_exists:
+                        raise ValidationError(
+                            f"No YAML configuration file found for agent '{name}' and no command provided"
+                        )
+                    
+                    # Clone the repository only after confirming YAML exists
+                    await self._clone_repo_async(repo_url, repo_dir)
+                    
+                    # Find the config file in the cloned repository
+                    config_path = await self._find_config_file(repo_dir)
+                    if not config_path:
+                        raise ValidationError(f"No TRANSPORT configuration file found for agent '{repo}'")
+                    
+                    try:
+                        command = await self._extract_command(config_path)
+                    except ValueError as e:
+                        raise ValidationError(str(e))
+                
+            else:
+                raise ValidationError(f"Unsupported agent type: {agent_type}")
+
+            # Create the agent handler
+            agent = AgentHandler(
+                name=name,
+                agent_type=agent_type,
+                repo_url=repo_url,
+                endpoint=endpoint,
+                command=command,
+                config_path=config_path
+            )
+            
+            # Only lock when updating the registry
+            async with self._lock:
+                # Double-check the agent doesn't exist (in case of race condition)
+                if name in self.registry["agents"]:
+                    raise ValueError(f"Agent '{name}' is already registered.")
+                
+                self.registry["agents"][name] = agent.to_dict()
+                self._save_registry()
+            
+            return agent
+            
+        except Exception as e:
+            # Clean up resources on error
+            if os.path.exists(repo_dir):
+                shutil.rmtree(repo_dir)
+            
+            if isinstance(e, ValidationError):
+                raise
+            else:
+                raise ValidationError(f"Failed to add agent '{name}': {str(e)}")
+   
     async def _validate_endpoint(self, endpoint: str, api_key: Optional[str] = None, TEST :bool = False) -> None:
         """
         Validate a remote tool endpoint by checking its format and accessibility.
@@ -444,7 +553,7 @@ class Registry:
                 shutil.rmtree(target_dir)
             raise ValidationError(f"Failed to clone repository: {stderr.decode().strip()}")
 
-    async def _find_config_file(self, tool_name: str, repo_dir: str) -> Optional[str]:
+    async def _find_config_file(self, repo_dir: str) -> Optional[str]:
         """
         Find a YAML configuration file in the repository.
         
@@ -471,77 +580,12 @@ class Registry:
         
         return None
 
-    async def add_agent(self,
-                  name: str,
-                  agent_type: str,
-                  repo_url: Optional[str] = None,
-                  endpoint: Optional[str] = None,
-                  command: Optional[str] = None) -> AgentHandler:
-        """
-        Add an agent to the registry.
-        
-        Args:
-            name: Name of the agent
-            agent_type: Type of the agent (local, remote, github)
-            repo_url: URL to the GitHub repository
-            endpoint: API endpoint for remote agents
-            command: Command to execute the agent
-            
-        Returns:
-            AgentHandler: The created agent handler
-            
-        Raises:
-            ValueError: If an agent with the same name already exists
-            ValidationError: If validation fails
-        """
-        async with self._lock:
-            if name in self.registry["agents"]:
-                raise ValueError(f"Agent '{name}' is already registered.")
-            
-            config_path = None
-            
-            # If repo_url is provided, clone the repo and check for YAML/YML file
-            if repo_url:
-                # Clone the repo first to check for config files
-                repo_dir = os.path.join(AGENTS_DIR, name)
-                await self._clone_repo_async(repo_url, repo_dir)
-                
-                # If no command is provided, search for YAML/YML file
-                if not command and agent_type == "local":
-                    config_path = await self._find_config_file(name, repo_dir)
-                    if not config_path:
-                        # Clean up cloned repo if no config file found
-                        if os.path.exists(repo_dir):
-                            shutil.rmtree(repo_dir)
-                        raise ValidationError(f"No YAML configuration file found for agent '{name}' and no command provided")
-            
-            # Create the agent handler
-            try:
-                agent = AgentHandler(
-                    name=name,
-                    agent_type=agent_type,
-                    repo_url=repo_url,
-                    endpoint=endpoint,
-                    command=command,
-                    config_path=config_path
-                )
-                
-                # Save to registry
-                self.registry["agents"][name] = agent.to_dict()
-                self._save_registry()
-                
-                return agent
-            except ValidationError as e:
-                # Clean up if validation fails
-                agent_dir = os.path.join(AGENTS_DIR, name)
-                if os.path.exists(agent_dir):
-                    shutil.rmtree(agent_dir)
-                raise ValidationError(f"Failed to add agent '{name}': {str(e)}")
-
 # WE have to edit this function such that we are considering two file type, YAML/YML, 
 # also the structure of the file so that we can extract commands from therw
+# here we also have to apply logic for hanlding the Agents as well as Tools command extraction,
+# as there will be states and other arguments required for running the agent.
 
-    async def extract_command(self, config_path: str) -> str:
+    async def _extract_command(self, config_path: str) -> str:
         """
         Extract the command from a YAML configuration file.
         
@@ -567,86 +611,6 @@ class Registry:
             logger.error(f"Error extracting command from {config_path}: {e}")
             raise ValueError(f"Failed to extract command from configuration file: {e}")
 
-    async def check_agent(self,
-                    name: str,
-                    agent_type: str,
-                    repo_url: Optional[str] = None,
-                    endpoint: Optional[str] = None,
-                    command: Optional[str] = None) -> Tuple[bool, Optional[str]]:
-        """
-        Check if an agent is valid based on the provided parameters.
-        
-        Args:
-            name: Name of the agent
-            agent_type: Type of the agent
-            repo_url: Repository URL for the agent
-            endpoint: Endpoint for the agent
-            command: Command to run the agent
-            
-        Returns:
-            Tuple[bool, Optional[str]]: (is_valid, error_message)
-        """
-        try:
-            # Check based on agent type
-            if agent_type == "remote":
-                if not endpoint:
-                    return False, "Remote agents must have an endpoint"
-                
-                # TODO: Implement actual endpoint validation logic
-                # For now, just assume the endpoint is valid
-                return True, None
-            
-            elif agent_type == "github" or agent_type == "local":
-                if repo_url:
-                    # Create a temporary directory to clone the repo
-                    temp_dir = os.path.join(AGENTS_DIR, f"temp_{name}")
-                    os.makedirs(temp_dir, exist_ok=True)
-                    
-                    try:
-                        # Clone the repo and check for YAML/YML file
-                        await self._clone_repo_async(repo_url, temp_dir)
-                        
-                        if command:
-                            # Command already provided, no need to check for YAML
-                            return True, None
-                        
-                        if agent_type == "local":
-                            # Search for YAML/YML file
-                            config_path = await self._find_config_file(name, temp_dir)
-                            if not config_path:
-                                return False, f"No YAML configuration file found for agent '{name}' and no command provided"
-                            
-                            # Extract command from YAML file
-                            try:
-                                await self.extract_command(config_path)
-                                return True, None
-                            except ValueError as e:
-                                return False, str(e)
-                        
-                        return True, None
-                        
-                    finally:
-                        # Clean up temporary directory
-                        if os.path.exists(temp_dir):
-                            shutil.rmtree(temp_dir)
-                
-                elif command and agent_type == "local":
-                    # Command provided directly
-                    return True, None
-                
-                elif not repo_url:
-                    return False, f"{agent_type.capitalize()} agents must have a repository URL"
-                
-                else:
-                    return False, f"Invalid configuration for {agent_type} agent"
-            
-            else:
-                return False, f"Unsupported agent type: {agent_type}"
-            
-        except Exception as e:
-            logger.error(f"Error checking agent '{name}': {e}")
-            return False, f"Error checking agent: {e}"
-
     def get_tool(self, name: str) -> Optional[Dict[str, Any]]:
         """
         Get a tool from the registry.
@@ -657,7 +621,7 @@ class Registry:
         Returns:
             Optional[Dict[str, Any]]: Tool information, or None if not found
         """
-        return self.registry["tools"].get(name)
+        return self.registry["tools"].get(name,None)
 
     def get_agent(self, name: str) -> Optional[Dict[str, Any]]:
         """
@@ -669,133 +633,114 @@ class Registry:
         Returns:
             Optional[Dict[str, Any]]: Agent information, or None if not found
         """
-        return self.registry["agents"].get(name)
+        return self.registry["agents"].get(name,None)
 
     async def remove_tool(self, name: str) -> bool:
         """
         Remove a tool from the registry.
-        
+
         Args:
-            name: Name of the tool
-            
+            name (str): Name of the tool to remove.
+
         Returns:
-            bool: True if the tool was removed, False otherwise
-            
+            bool: True if the tool was removed, False otherwise.
+
         Raises:
-            ValueError: If the tool is not found
+            ValueError: If the tool is not found.
         """
-        async with self._lock:
-            if name not in self.registry["tools"]:
-                raise ValueError(f"Tool '{name}' not found.")
-            
-            # Remove tool directory if it exists
-            tool_dir = os.path.join(TOOLS_DIR, name)
-            if os.path.exists(tool_dir):
-                shutil.rmtree(tool_dir)
-            
-            # Remove from registry
-            del self.registry["tools"][name]
-            self._save_registry()
-            
-            return True
+
+        # Check existence outside the lock
+        tool_handler :ToolHandler = self.registry["tools"].get(name, None)
+        if not tool_handler:
+            raise ValueError(f"Tool '{name}' not found.")
+
+        tool_dir = tool_handler.dir
+        # Remove tool directory asynchronously
+        try:
+            if tool_dir and os.path.exists(tool_dir):
+                await asyncio.to_thread(shutil.rmtree, tool_dir, ignore_errors=True)
+        
+
+            # Safely remove from registry
+            async with self._lock:
+                if name in self.registry["tools"]:  # Double-check inside lock to avoid race condition
+                    del self.registry["tools"][name]
+                    self._save_registry()
+        
+        except Exception as e:
+            raise e
+
+        return True
 
     async def remove_agent(self, name: str) -> bool:
         """
         Remove an agent from the registry.
-        
+
         Args:
-            name: Name of the agent
-            
+            name (str): Name of the agent to remove.
+
         Returns:
-            bool: True if the agent was removed, False otherwise
-            
+            bool: True if the agent was removed, False otherwise.
+
         Raises:
-            ValueError: If the agent is not found
+            ValueError: If the agent is not found.
         """
-        async with self._lock:
-            if name not in self.registry["agents"]:
-                raise ValueError(f"Agent '{name}' not found.")
-            
-            # Remove agent directory if it exists
-            agent_dir = os.path.join(AGENTS_DIR, name)
-            if os.path.exists(agent_dir):
-                shutil.rmtree(agent_dir)
-            
-            # Remove from registry
-            del self.registry["agents"][name]
-            self._save_registry()
-            
-            return True
 
-    async def bulk_remove_tools(self, names: List[str]) -> Dict[str, bool]:
-        """
-        Remove multiple tools from the registry.
-        
-        Args:
-            names: List of tool names to remove
-            
-        Returns:
-            Dict[str, bool]: Dictionary of {name: success} for each tool
-        """
-        result = {}
-        # Create tasks for each tool removal
-        tasks = [self._remove_tool_task(name) for name in names]
-        # Execute all tasks concurrently
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Process results
-        for name, res in zip(names, results):
-            if isinstance(res, Exception):
-                logger.error(f"Error removing tool '{name}': {res}")
-                result[name] = False
-            else:
-                result[name] = res
-        
-        return result
+        # Check existence outside the lock
+        agent_handler :AgentHandler = self.registry["agents"].get(name)
+        if not agent_handler:
+            raise ValueError(f"Agent '{name}' not found.")
 
-    async def _remove_tool_task(self, name: str) -> bool:
-        """
-        Helper method to remove a tool as a separate task.
+        agent_dir  = agent_handler.dir
         
-        Args:
-            name: Name of the tool
-            
-        Returns:
-            bool: True if the tool was removed, False otherwise
-        """
+        # Remove agent directory asynchronously
         try:
-            return await self.remove_tool(name)
+            if agent_dir and os.path.exists(agent_dir):
+                await asyncio.to_thread(shutil.rmtree, agent_dir, ignore_errors=True)
+
+            # Safely remove from registry
+            async with self._lock:
+                if name in self.registry["agents"]:  # Double-check inside lock to avoid race condition
+                    del self.registry["agents"][name]
+                    self._save_registry()
+
         except Exception as e:
-            logger.error(f"Error removing tool '{name}': {e}")
-            raise
+            raise e
 
-    async def bulk_remove_agents(self, names: List[str]) -> Dict[str, bool]:
+        return True
+    
+    async def remove_tools(self, names: list[str]) -> dict[str, bool]:
         """
-        Remove multiple agents from the registry.
-        
+        Remove multiple tools asynchronously with optimized execution.
+
         Args:
-            names: List of agent names to remove
-            
-        Returns:
-            Dict[str, bool]: Dictionary of {name: success} for each agent
-        """
-        result = {}
-        # Create tasks for each agent removal
-        tasks = [self._remove_agent_task(name) for name in names]
-        # Execute all tasks concurrently
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Process results
-        for name, res in zip(names, results):
-            if isinstance(res, Exception):
-                logger.error(f"Error removing agent '{name}': {res}")
-                result[name] = False
-            else:
-                result[name] = res
-        
-        return result
+            names (list[str]): List of tool names to remove.
 
-    async def _remove_agent_task(self, name: str) -> bool:
+        Returns:
+            dict[str, bool]: A dictionary mapping tool names to True (removed) or False (failed).
+        """
+
+        tasks = [self.remove_tool(name) for name in names]  
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        return {name: (res is True) for name, res in zip(names, results)}
+
+    async def remove_agents(self, names: list[str]) -> dict[str, bool]:
+        """
+        Remove multiple agents asynchronously with optimized execution.
+
+        Args:
+            names (list[str]): List of agent names to remove.
+
+        Returns:
+            dict[str, bool]: A dictionary mapping agent names to True (removed) or False (failed).
+        """
+
+        tasks = [self.remove_agent(name) for name in names]  
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        return {name: (res is True) for name, res in zip(names, results)}
+
         """
         Helper method to remove an agent as a separate task.
         
@@ -827,28 +772,14 @@ class Registry:
         Raises:
             ValueError: If the tool is not found or cannot be loaded
         """
-        tool_info : ToolHandler = self.get_tool(name) #here tool_info is of type ToolHandler class object.
-        if not tool_info:
+        tool_handler : ToolHandler = self.get_tool(name) #Here tool_info is of type ToolHandler class object.
+        if not tool_handler:
             raise ValueError(f"Tool '{name}' not found in registry.")
         
-        if tool_info["tool_type"] == "local":
+        if tool_handler.tool_type == "LOCAL":
             # First check if we need to use the command
-            if tool_info.get("command"):
-                logger.info(f"Tool '{name}' uses command: {tool_info['command']}")
-                return tool_info
-            
-            # If no command, check if we have a config file
-            if tool_info.get("config_path") and os.path.exists(tool_info["config_path"]):
-                try:
-                    command = await self.extract_command(tool_info["config_path"])
-                    logger.info(f"Extracted command for tool '{name}': {command}")
-                    # Update the tool info with the extracted command
-                    tool_info["command"] = command
-                    self.registry["tools"][name]["command"] = command
-                    self._save_registry()
-                    return tool_info
-                except ValueError:
-                    pass  # Fall back to loading the module
+            if tool_handler.command:
+                return tool_handler
             
             # If no command or config, try to load the module
             module_path = os.path.join(TOOLS_DIR, name, "tool.py")
@@ -875,28 +806,14 @@ class Registry:
         Raises:
             ValueError: If the agent is not found or cannot be loaded
         """
-        agent_info = await self.get_agent(name)
-        if not agent_info:
+        agent_handler : AgentHandler = await self.get_agent(name)
+        if not agent_handler:
             raise ValueError(f"Agent '{name}' not found in registry.")
         
-        if agent_info["agent_type"] == "local":
+        if agent_handler.agent_type == "LOCAL":
             # First check if we need to use the command
-            if agent_info.get("command"):
-                logger.info(f"Agent '{name}' uses command: {agent_info['command']}")
-                return agent_info
-            
-            # If no command, check if we have a config file
-            if agent_info.get("config_path") and os.path.exists(agent_info["config_path"]):
-                try:
-                    command = await self.extract_command(agent_info["config_path"])
-                    logger.info(f"Extracted command for agent '{name}': {command}")
-                    # Update the agent info with the extracted command
-                    agent_info["command"] = command
-                    self.registry["agents"][name]["command"] = command
-                    self._save_registry()
-                    return agent_info
-                except ValueError:
-                    pass  # Fall back to loading the module
+            if agent_handler.command:
+                return agent_handler
             
             # If no command or config, try to load the module
             module_path = os.path.join(AGENTS_DIR, name, "agent.py")
@@ -905,7 +822,7 @@ class Registry:
             except Exception as e:
                 raise ValueError(f"Failed to load agent module: {e}")
         
-        return agent_info
+        return agent_handler
 
     async def _load_module_async(self, module_path: str) -> Any:
         """
