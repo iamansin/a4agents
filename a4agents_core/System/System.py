@@ -10,6 +10,10 @@ from Registry import BaseRegistry
 
 logger = logging.getLogger(__name__)
 
+class ValidationError(Exception):
+    """Custom exception for validation errors in the registry."""
+    pass
+
 class Main_Actor_Class:
     func_store : Dict
 
@@ -274,5 +278,55 @@ class System:
             raise e
             print(f"Error while generating Mermaid diagram: {e}")
 
+    async def register4agent(self,name: str, 
+                    endpoint: Optional[str] = None, 
+                    api_key: Optional[str] = None,
+                    repo_url: Optional[str] = None):
+        
+        # if name in self._registry.get_agent_names():
+        #     raise ValueError(f"Agent '{name}' is already registered.")
+        
+        if not endpoint and not repo_url:
+            raise ValidationError("Agent must have either an endpoint or repository URL")
+        
+        if endpoint and repo_url:
+            raise ValidationError("Agent cannot have both an endpoint and repository URL")
+        
+        if endpoint:
+            agent_type = "MCP"
+            
+        elif repo_url:
+            agent_type = "LOCAL"
+            
+        try:
+            await self._registry.add_agent_package(name, agent_type, endpoint, api_key, repo_url)
+            
+        except Exception as e :
+            raise e
+    
+    async def register4tool(self,name: str, 
+                    endpoint: Optional[str] = None, 
+                    api_key: Optional[str] = None,
+                    repo_url: Optional[str] = None):
+        
+        if not endpoint and not repo_url:
+            raise ValidationError("Tool must have either an endpoint, repository URL")
+        
+        if endpoint and repo_url:
+            raise ValidationError("Tool cannot have both an endpoint and repository URL")
+        
+        
+        # if name in self._registry.get_tool_names():
+        #     raise ValueError(f"Tool '{name}' is already registered.")
 
-
+        if endpoint:
+            tool_type = "MCP"
+            
+        elif repo_url:
+            tool_type = "LOCAL"
+            
+        try:
+            await self._registry.add_tool_package(name, tool_type, endpoint, api_key, repo_url)
+        
+        except Exception as e:
+            raise e
