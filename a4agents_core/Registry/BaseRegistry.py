@@ -12,15 +12,13 @@ import logging
 import importlib.util
 from typing import Dict, List, Optional, Union, Any, Tuple
 from pathlib import Path
-# import subprocess
-# import yaml
+from enum import Enum
 from dataclasses import dataclass, asdict
-# import glob
-# import tempfile
 import aiohttp
 from urllib.parse import urlparse
 
 from .WheelInstaller import WheelInstaller
+from Utils._Singleton import Singleton
 
 # Configure logging
 logging.basicConfig(
@@ -35,94 +33,27 @@ REGISTRY_DIR = "Registry"
 TOOLS_DIR = os.path.join(REGISTRY_DIR, "Tools")
 AGENTS_DIR = os.path.join(REGISTRY_DIR, "Agents")
 BASE_VENV_DIR = os.path.join(REGISTRY_DIR, "venv")
-YAML_EXTENSIONS = [".yaml", ".yml"]
-ETYPES = ["LOCAL", "MCP"]
-CONFIG_FILE_TYPES = [f"TRANSPORT.yml", f"TRANSPORT.yaml"]
 
+
+class MCPTYPES(Enum):
+    LOCAL = "LOCAL"
+    REMOTE = "REMOTE"
+    
+class ETYPES(Enum):
+    CUSTOM = "CUSTOM"
+    MCP = "MCP"
+    
+    
 class ValidationError(Exception):
     """Custom exception for validation errors in the registry."""
     pass
 
-@dataclass
-class ToolHandler:
-    """
-    Class to handle and store details about tools.
-    
-    Attributes:
-        name (str): Unique identifier for the tool
-        tool_type (str): Type of tool (langchain, mcp-server, local, etc.)
-        endpoint (Optional[str]): API endpoint for remote tools
-        api_key (Optional[str]): API key for authentication
-        command (Optional[str]): Command to execute the tool
-        config_path (Optional[str]): Path to configuration file
-    """
-    name: str
-    tool_type: str
-    endpoint: Optional[str] = None
-    api_key: Optional[str] = None
-    venv_path : Optional[str] = None
-    entry_point : Optional[str] = None
-    dir : Optional[str] = None
-    
-    
-    def __post_init__(self):
-        """Validate the ToolHandler attributes after initialization."""
-        if not self.name or not isinstance(self.name, str):
-            raise ValidationError("Tool name must be a non-empty string")
-        
-        if not self.tool_type or not isinstance(self.tool_type, str):
-            raise ValidationError("Tool type must be a non-empty string")
-        
-        if self.tool_type == "MCP" and not self.endpoint:
-            raise ValidationError("MCP tool must have an endpoint")
-            
-        if self.tool_type == "LOCAL" and not (self.venv_path and self.dir):
-                raise ValidationError("Local tool must have command config path and directory path")
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert the ToolHandler instance to a dictionary."""
-        return asdict(self)
-
-
-@dataclass
-class AgentHandler:
-    """
-    Class to handle and store details about agents.
-    
-    Attributes:
-        name (str): Unique identifier for the agent
-        agent_type (str): Type of agent (local, remote, github)
-        repo_url (Optional[str]): URL to the GitHub repository
-        endpoint (Optional[str]): API endpoint for remote agents
-        command (Optional[str]): Command to execute the agent
-        config_path (Optional[str]): Path to configuration file
-    """
-    name: str
-    agent_type: str
-    endpoint: Optional[str] = None
-    venv_path : Optional[str] = None
-    entry_point : Optional[str] = None   
-    dir : Optional[str] = None
-    
-    def __post_init__(self):
-        """Validate the AgentHandler attributes after initialization."""
-        if not self.name or not isinstance(self.name, str):
-            raise ValidationError("Agent name must be a non-empty string")
-        
-        if not self.agent_type or not isinstance(self.agent_type, str):
-            raise ValidationError("Agent type must be a non-empty string")
-        
-        if self.agent_type == "MCP" and not self.endpoint:
-            raise ValidationError("MCP Agent must have an endpoint")
-
-        if self.agent_type == "LOCAL" and not (self.venv_path and self.entry_point and self.dir):
-                raise ValidationError("Local Agent must have command config path and directory path")
-    
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert the AgentHandler instance to a dictionary."""
-        return asdict(self)
-
-
+# Here we are expecting the Registry to act as a Singelton type of object, 
+# but we are not enforcing the strictness of the Singleton pattern as,
+# this class is not an object created by the user but is created by the system itself.
+# if in rare case another instance of this class will be created then there will not Singleton Error raised.
+# The other class will also refer to this one only.
+@Singleton(strict=False,thread_safe=True,debug=False)
 class Registry:
     """
     A registry for managing tools and agents.
@@ -210,7 +141,7 @@ class Registry:
             "agents": list(self.registry["agents"].keys())
         }
         
-    async def add_tool_package(self, 
+    async def add_tool(self, 
                     name: str, 
                     tool_type: str, 
                     endpoint: Optional[str] = None, 
@@ -218,60 +149,63 @@ class Registry:
                     repo_url: Optional[str] = None) -> ToolHandler:
         
         
-        try:
-            # Validate inputs based on tool type before acquiring any locks
-            if tool_type == "MCP":
-                if not endpoint:
-                    raise ValidationError("MCP tools must have an endpoint")
-                
-                # Validate the endpoint URL format and accessibility
-                await self._validate_endpoint(endpoint, api_key)
-                
-            elif tool_type == "LOCAL":
-                parsed_url = urlparse(repo_url)
-                path_parts = parsed_url.path.strip('/').split('/')
-                owner, repo = path_parts[0], path_parts[1]
-                repo_dir = os.path.join(TOOLS_DIR, repo)
-                    # Clone the repository only after confirming YAML exists
-                package_path = await self._clone_repo_async(repo_url, repo_dir)
-                venv_path, executable_path = await self.wheel_installer.install_wheel(package_path)
+        if tool_type == ETYPES.MCP:
+            try:
+                # Validate inputs based on tool type before acquiring any locks
+                if tool_type == MCPTYPES.REMOTE:
+                    if not endpoint:
+                        raise ValidationError("MCP tools must have an endpoint")
                     
-            else:
-                raise ValidationError(f"Unsupported tool type: {tool_type}")
+                    # Validate the endpoint URL format and accessibility
+                    await self._validate_endpoint(endpoint, api_key)
+                    
+                elif tool_type == MCPTYPES.LOCAL:
+                    parsed_url = urlparse(repo_url)
+                    path_parts = parsed_url.path.strip('/').split('/')
+                    owner, repo = path_parts[0], path_parts[1]
+                    repo_dir = os.path.join(TOOLS_DIR, repo)
+                        # Clone the repository only after confirming YAML exists
+                    package_path = await self._clone_repo_async(repo_url, repo_dir)
+                    venv_path, executable_path = await self.wheel_installer.install_wheel(package_path)
+                        
+                else:
+                    raise ValidationError(f"Unsupported tool type: {tool_type}")
 
-            # Create the ToolHandler instance
-            tool = ToolHandler(
-                name=name,
-                tool_type=tool_type,
-                endpoint=endpoint,
-                api_key=api_key,
-                venv_path = venv_path,
-                entry_point = executable_path,
-                dir = repo_dir
-            )
-            
-            # Only lock when updating the registry
-            async with self._lock:
-                # Double-check the tool doesn't exist (in case of race condition)
-                if name in self.registry["tools"]:
-                    raise ValueError(f"Tool '{name}' is already registered.")
+                # Create the ToolHandler instance
+                tool = ToolHandler(
+                    name=name,
+                    tool_type=tool_type,
+                    endpoint=endpoint,
+                    api_key=api_key,
+                    venv_path = venv_path,
+                    entry_point = executable_path,
+                    dir = repo_dir
+                )
                 
-                self.registry["tools"][name] = tool.to_dict()
-                self._save_registry()
+                if self._executor:
+                    tool.set_executor(self._executor)
+                # Only lock when updating the registry
+                async with self._lock:
+                    # Double-check the tool doesn't exist (in case of race condition)
+                    if name in self.registry["tools"]:
+                        raise ValueError(f"Tool '{name}' is already registered.")
+                    
+                    self.registry["tools"][name] = tool.to_dict()
+                    self._save_registry()
+                
+                return 
             
-            return tool
-        
-        except Exception as e:
-            # Clean up resources on error
-            if os.path.exists(repo_dir):
-                shutil.rmtree(repo_dir)
-            
-            if isinstance(e, ValidationError):
-                raise
-            else:
-                raise ValidationError(f"Failed to add tool '{name}': {str(e)}")
+            except Exception as e:
+                # Clean up resources on error
+                if os.path.exists(repo_dir):
+                    shutil.rmtree(repo_dir)
+                
+                if isinstance(e, ValidationError):
+                    raise
+                else:
+                    raise ValidationError(f"Failed to add tool '{name}': {str(e)}")
     
-    async def add_agent_package(self, 
+    async def add_agent(self, 
                     name: str, 
                     agent_type: str, 
                     endpoint: Optional[str] = None, 
@@ -303,14 +237,14 @@ class Registry:
         
         try:
             # Validate inputs based on agent type before acquiring any locks
-            if agent_type == "MCP":
+            if agent_type == ETYPES.MCP_REMOTE:
                 if not endpoint:
                     raise ValidationError("MCP agents must have an endpoint")
                 
                 # Validate the endpoint URL format and accessibility
                 await self._validate_endpoint(endpoint)
                 
-            elif agent_type == "LOCAL":
+            elif agent_type == ETYPES.MCP_LOCAL:
                 # Extract repo info (owner, repo) from URL
                 parsed_url = urlparse(repo_url)
                 path_parts = parsed_url.path.strip('/').split('/')
@@ -333,6 +267,10 @@ class Registry:
                 entry_popint = executable_path,
                 dir = repo_dir
             )
+            
+            # Inject the executor
+            if self._executor:
+                agent.set_executor(self._executor)
             
             # Only lock when updating the registry
             async with self._lock:
@@ -578,7 +516,7 @@ class Registry:
         if not tool_handler:
             raise ValueError(f"Tool '{name}' not found in registry.")
         
-        if tool_handler.tool_type == "LOCAL":
+        if tool_handler.tool_type == ETYPES.MCP_LOCAL:
             # First check if we need to use the command
             if tool_handler.command:
                 return tool_handler
@@ -612,7 +550,7 @@ class Registry:
         if not agent_handler:
             raise ValueError(f"Agent '{name}' not found in registry.")
         
-        if agent_handler.agent_type == "LOCAL":
+        if agent_handler.agent_type == ETYPES.MCP_LOCAL:
             # First check if we need to use the command
             if agent_handler.command:
                 return agent_handler
@@ -662,7 +600,7 @@ class Registry:
 
     #     Args:
     #         name: Name of the tool.
-    #         tool_type: Type of the tool ("remote" or "local").
+    #         tool_type: Type of the tool ("remote" or ETYPES.MCP_LOCAL).
     #         endpoint: Endpoint for remote tools.
     #         api_key: API key for authentication (remote tools).
     #         command: Command to run the tool.
@@ -687,14 +625,14 @@ class Registry:
     #     # temp_dir = None
     #     try:
     #         # Validate inputs based on tool type before acquiring any locks
-    #         if tool_type == "MCP":
+    #         if tool_type == ETYPES.MCP_REMOTE:
     #             if not endpoint:
     #                 raise ValidationError("MCP tools must have an endpoint")
                 
     #             # Validate the endpoint URL format and accessibility
     #             await self._validate_endpoint(endpoint, api_key)
                 
-    #         elif tool_type == "LOCAL":
+    #         elif tool_type == ETYPES.MCP_LOCAL:
     #                 # Extract repo info (owner, repo) from URL
     #             parsed_url = urlparse(repo_url)
     #             path_parts = parsed_url.path.strip('/').split('/')
@@ -799,7 +737,7 @@ class Registry:
     #             # Validate the endpoint URL format and accessibility
     #             await self._validate_endpoint(endpoint)
                 
-    #         elif agent_type == "LOCAL":
+    #         elif agent_type == ETYPES.MCP_LOCAL:
     #             # Extract repo info (owner, repo) from URL
     #             parsed_url = urlparse(repo_url)
     #             path_parts = parsed_url.path.strip('/').split('/')

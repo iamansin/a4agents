@@ -1,12 +1,25 @@
-from typing import Callable, Optional, Dict, Any, Tuple, List, Union
+from typing_extensions import (
+    Callable, 
+    Optional,
+    Dict,
+    Any, 
+    Tuple, 
+    List, 
+    Union,
+    TypedDict)
 import time
 import logging
 import base64
 import ray 
-
+from dataclasses import dataclass, field
+import functools
+from enum import Enum, auto
+from pydantic import BaseModel
 #self Imports
-from ETools.ETools import ETool
-from Registry import BaseRegistry
+from a4agents_core.Utils._Singleton import Singleton
+from Registry.BaseRegistry import Registry, ETYPES
+from Router.Router import Router, EdgeType
+from Registry.Hanlder import AgentHandler, ToolHandler
 
 logger = logging.getLogger(__name__)
 
@@ -14,59 +27,151 @@ class ValidationError(Exception):
     """Custom exception for validation errors in the registry."""
     pass
 
-class Main_Actor_Class:
-    func_store : Dict
+class SelfLoopCondition(Exception):
+    """Custom exception for self-loop conditions in the routing graph."""
+    pass
 
-    async def add_function(self, func_name, func_ref):
-        self.func_store[func_name] = func_ref
-        
+class RouteValidationError(Exception):
+    """Custom exception for route validation errors in the routing graph."""
+    pass
 
+class NodeCreationError(Exception):
+    """Custom exeception for Node Creation errors in the System class"""
 
-class Actor_Initializer:
-    def __init__(self,**kwargs):
-        self._Actor = ray.remote.options(**kwargs)(Main_Actor_Class)
+class NodeType(Enum):
+    NODE = auto()
+    TOOL = auto()
+    AGENT = auto()
+    
 
+@dataclass(frozen=True, slots=True)
 class SystemNode:
-    """Encapsulates a function as a node in the LangGraph System."""
+    """Encapsulates a node in the LangGraph System with enhanced performance using slots."""
 
-    def __init__(self, name: str, func: Callable, is_tool: bool = False, scale :bool = False, **kwargs):
+    name: str
+    node_type: NodeType
+    function: Optional[Callable] = None
+    handler: Optional[Any] = None  # ToolHandler or AgentHandler
+    scale: bool 
+    resources: Dict[str, Any] = field(default_factory=dict)
+    if scale:
+        task = ray.remote(function)
+    
+    def __post_init__(self):
+        """Validate the node configuration and set up Ray task if scaling is enabled."""
+        # Validate function or handler based on node type
+        if self.node_type == NodeType.NODE and not callable(self.function):
+            raise ValueError(f"Node '{self.name}' requires a callable function")
+            
+        if self.node_type in (NodeType.TOOL, NodeType.AGENT) and self.handler is None:
+            raise ValueError(f"{self.node_type.name.capitalize()} '{self.name}' requires a handler")
+
+        logger.info(f"SystemNode '{self.name}' initialized as {self.node_type.name}")
+
+# Here get_callable() method returns a wrapper which encapsulates the 
+# original logic for execution of the particular node type.
+# We are creating a wrapper here so as to provide an additional functionality,
+# this wrapper takes state as an argument and returns the state after node execution.
+# The state is updated based on the node result rather then keyword this decreases KeyNotFound error.
+# as well as provides flexibility to us.
+    def get_callable(self) -> Callable:
         """
-        Initializes the SystemNode.
-
-        :param func: Function to be used in the node. Should ideally be a LangChain Runnable.
-        :param name: Unique name for the node.
-        :param resources: Resource allocation (currently conceptual for Ray integration later).
-        :param is_tool: Flag to indicate if the node represents a tool.
+        Returns a callable function suitable for use in LangGraph.
+        
+        The returned function will:
+        1. Have the same name as the node for better error reporting
+        2. Execute the appropriate logic based on node type
+        3. Handle state management for LangGraph compatibility
+        
+        Returns:
+            Callable: A function that can be registered with LangGraph
         """
-        self._name = name
-        self._resources = {**kwargs}
-        self._func = func # Store the original function directly, LangGraph will handle Runnable conversion
-        self._is_tool = is_tool
-        self._scale = scale
-        if scale:
-            self._task = ray.remote.options(**kwargs)(func)
-        logger.info(f"SystemNode '{self.name}' initialized.")
+        if self.node_type == NodeType.NODE:
+            # For regular nodes, return the function directly or wrapped for Ray
+            if self.scale and self.task is not None:
+                # Create a wrapper for Ray remote execution
+                @functools.wraps(self.function)
+                async def ray_wrapper(state):
+                    try:
+                        # Execute remotely and get result
+                        result = ray.get(self.task.remote(state))
+                        return result
+                    except Exception as e:
+                        logger.error(f"Error executing node '{self.name}' remotely: {str(e)}")
+                        raise RuntimeError(f"Failed to execute node '{self.name}': {str(e)}") from e
+                
+                # Ensure the wrapper has the same name as the node
+                ray_wrapper.__name__ = self.name
+                return ray_wrapper
+            else:
+                # For non-Ray execution, return the function with proper name
+                @functools.wraps(self.function)
+                async def function_wrapper(state):
+                    try:
+                        return self.function(state)
+                    except Exception as e:
+                        logger.error(f"Error executing node '{self.name}': {str(e)}")
+                        raise RuntimeError(f"Failed to execute node '{self.name}': {str(e)}") from e
+                    
+                function_wrapper.__name__ = self.name
+                return function_wrapper
+
+                
+        elif self.node_type in (NodeType.TOOL, NodeType.AGENT):
+            # For tools and agents, create a wrapper that uses the handler
+            @functools.wraps(self.handler.execute)
+            async def handler_wrapper(state):
+                try:
+                    # Execute the handler and update state with the result
+                    result = self.handler.execute(state)
+                    
+                    # Create a new state to avoid mutation issues
+                    new_state = state.copy() if hasattr(state, 'copy') else dict(state)
+                    new_state[self.name] = result
+                    return new_state
+                except Exception as e:
+                    logger.error(f"Error executing {self.node_type.name.lower()} '{self.name}': {str(e)}")
+                    raise RuntimeError(f"Failed to execute {self.node_type.name.lower()} '{self.name}': {str(e)}") from e
+            
+            # Ensure the wrapper has the same name as the node
+            handler_wrapper.__name__ = self.name
+            return handler_wrapper
+        
+        # This should never happen due to validation in __post_init__
+        raise ValueError(f"Unsupported node type: {self.node_type}")
 
 
+@Singleton(strict=True,thread_safe=True,debug=False)
 class System:
     """A robust AI agent system integrated with LangGraph."""
+    
+    _nodes :Dict[str , SystemNode]= {}  #-> {"node_name" : SystemNode() , ....}
+    _routers :Dict[str, List[Router]] = {} #-> {"from_node" : [Router() ,....]}
+    _routing_dict :Dict[str, Dict[str,str]]= {} #-> {}
+    _resource_distribution_map = {}
+    _registry = Registry()
+    _entry_node = None
+    _end_node = None
+    _embedding_model =  None # Optional embedding model for routing
 
-    def __init__(self, name: str, state_schema :dict, **kwargs):
-        self.name = name
-        self.State = state_schema
+    def __init__(self, name: str, 
+                 state_schema :dict, 
+                 embedding_model =None, 
+                 use_model :bool = False, 
+                 **kwargs):
+        
+        self.name :str = name
+        self.State :Union[BaseModel,Dict] = state_schema
         self._system_resources = {**kwargs}
-        self._system_actor= Actor_Initializer(*kwargs)
-        self._nodes = {}  # Stores agent nodes (SystemNode instances)
-        self._router_mappings = {} #stores (Router Instances)
-        self._resource_distribution_map = {}
-        self._graph = None
-        self._registry = BaseRegistry()
-         
-    def node(self, name: Optional[str] = None, 
+        # self._system_actor= Actor_Initializer(*kwargs)
+        if embedding_model and use_model:
+            self._embedding_model = embedding_model
+        
+    @classmethod
+    def node(cls, name: Optional[str] = None, 
              func: Optional[Callable] = None, 
              resources: Optional[Dict[str, Any]] = None, 
-             is_tool: bool = False, 
-             scale :bool =False):
+             scale :bool =False,):
         """
         Registers a function as a SystemNode in the LangGraph, supporting both decorator and direct function call.
 
@@ -89,22 +194,25 @@ class System:
             if not isinstance(name, str) or not name.strip():
                 raise ValueError("Node name must be a non-empty string.")
 
-            if name in self._nodes:
-                raise ValueError(f"Node name '{name}' already exists in system '{self.name}'.")
-
-            if any(node.func == func for node in self._nodes.values()): # Comparing original function, not task
-                raise ValueError(f"Function '{func.__name__}' is already registered under a different name.")
+            if name in cls._nodes:
+                raise  NodeCreationError(f"Node name '{name}' already exists in system '{cls.name}'.")
 
             try:
-                node = SystemNode(name, func, is_tool, scale,resources)
-                self._nodes[name] = node
+                node = SystemNode(name= name,
+                                  function = func,
+                                  node_type= NodeType.NODE,
+                                  scale= scale,
+                                  resources=resources,
+                                  )
+                
+                cls._nodes[name] = node
                 if scale:
-                    self._resource_distribution_map[name] = {**resources}
-                logger.info(f"Node '{name}' added to System '{self.name}'.")
+                    cls._resource_distribution_map[name] = resources
+                logger.info(f"Node '{name}' added to System '{cls.name}'.")
                 return node
             except Exception as e:
                 logger.error(f"Error creating node '{name}': {str(e)}")
-                raise
+                raise NodeCreationError(f"Error creating node '{name}': {str(e)}")
 
         # If `func` is provided, it's being used directly: `system.node(my_function, name="my_node")`
         if func is not None:
@@ -130,70 +238,121 @@ class System:
 
         for name, args in func_dict.items():
             try:
-                self.node(func=args[0], name=name, resources=args[1])
+                self.node(name=name, func=args[0], resources= args[1] if len(args)>1 else None)
             except Exception as e:
                 logger.error(f"Error adding node '{name}': {str(e)}")
                 raise
-
-    def set_entry_point(self, entry_point_node: str):
-        """Sets the entry point node for the LangGraph graph."""
-        if self._entry_node:
-            raise ValueError(f"Node :{self._entry_node} is already set as entry point.")
-        if entry_point_node not in self._nodes:
-            raise ValueError(f"Entry point node '{entry_point_node}' not registered in the system.")
-        self._graph.set_entry_point(self._nodes[entry_point_node].func) # Assuming SystemNode.func is LangChain Runnable
-        self._entry_node = entry_point_node
         
-    def add_router(self, from_node: str, direct_edges: List, conditional_edges :Dict[str,str]):
+    @classmethod
+    def add_route(cls, from_node: str, 
+                  to_node : Optional[str] =None,
+                  to_multiple_nodes: Optional[List[str]] = None,
+                  use_model_routing :bool = False,
+                  allow_self_loop: bool = False):
         
-        if from_node not in self._nodes:
+        if not any(to_node, to_multiple_nodes):
+            raise RouteValidationError("Must Provide either single node name or a List containing multiple node names.")
+        if to_node and to_multiple_nodes:
+            raise RouteValidationError("Provide either single node name or a List containing multiple node names.")
+        if from_node not in cls._nodes:
             raise ValueError(f"From node '{from_node}' not registered in the system.")
-        if direct_edges:
-            for node in direct_edges:
-                if node not in self._nodes:
-                    raise ValueError(f"No Node with name {node} found in the System!")
-        if conditional_edges:
-            edges = {}
-            for condition_value, to_node_name in conditional_edges.items():
-                if to_node_name not in self._nodes:
-                    raise ValueError(f"No Node with name {node} found in the System!")
-                edges[condition_value] = self._nodes[to_node_name].func # Map condition value to LangGraph Runnable
-
-            self._graph.add_conditional_edges(
-                self._nodes[from_node].func, condition_func, edges
-            )
-        logger.info(f"Added conditional edges from '{from_node}' with conditions '{conditional_edge_mapping}'.")
         
-        pass
+        _node_list = [to_node] if to_node else to_multiple_nodes
+        for node in _node_list: # here we are directly raising the error.
+            if not isinstance(node, str) or not node.strip():
+                raise TypeError(f"Node name '{node}' must be a non-empty string.")
+            if node not in cls._nodes:
+                raise ValueError(f"No Node with name {node} found in the System!")
+            if node == from_node and not allow_self_loop:
+                raise SelfLoopCondition(f"Node '{from_node}' is routing to itself. May cause infinite loop.")
+            if node in cls._routing_dict[from_node]: #_self.routing_dict : {from_node: {node: "Direct"/"Conditional"}}
+                raise RouteValidationError(f" {cls._routing_dict[from_node].get(node)} Route from '{from_node}' to '{node}' already exists.")
+        try:
+            _router = Router(from_node=from_node, 
+                             direct_nodes=_node_list,
+                             use_embeddings=use_model_routing,
+                             embedding_model= cls._embedding_model if use_model_routing else None, 
+                             router_type= EdgeType.DIRECT,
+                             )# Assuming this is defined somewhere in the class
+            if cls._routers.get(from_node,None) is not None:
+                cls._routers[from_node].append(_router)
+            else:
+                cls._routers[from_node] = [_router]
+                
+        except Exception as e: # here we are catching the error from lower level and then raising the error.
+            raise RouteValidationError(f"Error creating router from '{from_node}' to '{to_multiple_nodes}': {str(e)}") from e
     
-    def add_edge(self, from_node :str, to_node: str, ): # Renamed from add_route to align with LangGraph naming
-        """Adds a direct edge in the LangGraph graph."""
+    @classmethod
+    def add_conditional_route(self, from_node: str, 
+                              to_node : Optional[Dict[str,str]] = None,
+                              to_multiple_nodes: Optional[List[Dict[str, str]]] = None, 
+                              use_model_routing :bool = False
+                              ,allow_self_loop: bool = False):
+        """
+        Adds a conditional route from one node to multiple nodes based on a condition function.
+        :param from_node: Name of the source node.
+        :param to_nodes: Dictionary where keys are condition names and values are target node names.
+        :param condition_func: Function that determines the routing condition.
+        """
+        if not any(to_node, to_multiple_nodes):
+            raise RouteValidationError("Must Provide either single node name or a List containing multiple node names.")
+        if to_node and to_multiple_nodes:
+            raise RouteValidationError("Provide either single node name or a List containing multiple node names.")
         if from_node not in self._nodes:
             raise ValueError(f"From node '{from_node}' not registered in the system.")
-        if to_node not in self._nodes:
-            raise ValueError(f"To node '{to_node}' not registered in the system.")
+        
+        _node_dict : Dict = to_node if to_node else to_multiple_nodes
+        for condition, node in _node_dict.items():
+            if not isinstance(condition, str) or not condition.strip():
+                raise TypeError(f"Condition name '{condition}' must be a non-empty string.")
+            if not isinstance(node, str) or not node.strip():
+                raise TypeError(f"Node name '{node}' must be a non-empty string.")
+            if node not in self._nodes:
+                raise ValueError(f"No Node with name {node} found in the System!")
+            if node == from_node and not allow_self_loop:
+                raise SelfLoopCondition(f"Node '{from_node}' is routing to itself. May cause infinite loop.")
+            if node in self._routing_dict[from_node]:
+                raise RouteValidationError(f"Route from '{from_node}' to '{node}' already exists.")
 
-        self._graph.add_edge(self._nodes[from_node].func, self._nodes[to_node].func) # Connect LangGraph Runnables
-        logger.info(f"Added direct edge from '{from_node}' to '{to_node}'.")
-
-    def tool(self, tool_name :str, tool_func :Union[Callable,ETool]):
+        try:
+            _router = Router(from_node=from_node, 
+                             conditional_nodes=_node_dict, 
+                             use_embeddings= use_model_routing,
+                             embedding_model= self._embedding_model if use_model_routing else None,
+                             router_type= EdgeType.CONDITIONAL,
+                            )
+            if self._routers.get(from_node,None) is not None:
+                self._routers[from_node].append(_router)
+            else:
+                self._routers[from_node] = [_router]
+        except Exception as e:
+            raise RouteValidationError(f"Error creating router from '{from_node}' to '{_node_dict}': {str(e)}") from e
+    
+    @classmethod
+    def tool(self, 
+            tool_name :str, 
+            tool_func :Optional[Callable] = None,):
         """This method is used to add tools into the system."""
         
-        def register_tool(tool_func:Union[Callable,ETool]):
+        def register_tool(tool_func:Union[Callable]):
+            
+            if tool_name is None or not isinstance(tool_name, str) or not tool_name.strip():
+                raise TypeError("Tool name must be a non-empty string.")
             if tool_name in self._nodes:
                 raise ValueError(f"A Node with name {tool_name} already exists.")
             
-            if self._registry.check_existing_tool(tool_name):
+            if not self._registry.get_tool(tool_name):
                 raise ValueError(f"The Tool {tool_name} already exists in the Registry.")
             
-            if not isinstance(tool_func,Callable) or not isinstance(tool_func,ETool):
-                raise ValueError("The tool_func should be a type of Callable or an isntance of ETool.")
+            if not isinstance(tool_func,Callable):
+                raise ValueError("The tool_func should be a type of Callable function.")
             
-            if isinstance(tool_func,Callable):
-                tool_func = ETool(tool_name, tool_func)
-        
-            self._tools[name] = tool_func
-        
+            try:
+                self._registry.add_tool(tool_name, 
+                                        tool_func,
+                                        tool_type=ETYPES.CUSTOM)
+            except Exception as e:
+                raise e
         
         if tool_func is not None:
             return register_tool(tool_func)
@@ -202,13 +361,66 @@ class System:
             return register_tool(tool_func)
         
         return decorator
+    
+    async def register4tool(self,name: str, 
+                    endpoint: Optional[str] = None, 
+                    api_key: Optional[str] = None,
+                    repo_url: Optional[str] = None):
         
-    def set_workflow_end_node(self, node_name: str):
+        if not endpoint and not repo_url:
+            raise ValidationError("Tool must have either an endpoint, repository URL")
+        
+        if endpoint and repo_url:
+            raise ValidationError("Tool cannot have both an endpoint and repository URL")
+        
+        
+        # if name in self._registry.get_tool_names():
+        #     raise ValueError(f"Tool '{name}' is already registered.")
+
+        if endpoint:
+            tool_type = "MCP"
+            
+        elif repo_url:
+            tool_type = "LOCAL"
+            
+        try:
+            await self._registry.add_tool_package(name, tool_type, endpoint, api_key, repo_url)
+        
+        except Exception as e:
+            raise e
+
+    async def register4agent(self,
+                            endpoint: Optional[str] = None, 
+                            api_key: Optional[str] = None,
+                            repo_url: Optional[str] = None):
+        
+
+            
+        try:
+            await self._registry.add_agent_package(name, agent_type, endpoint, api_key, repo_url)
+            
+        except Exception as e :
+            raise e
+        
+    def set_entry_node(self, node_name: str):
+        """Sets the entry point node for the LangGraph graph."""
+        if not isinstance(node_name,str) or not node_name.strip():
+            raise TypeError("The entry point name should be a non-empty string.")
+        if self._entry_node:
+            raise ValueError(f"Node :{self._entry_node} is already set as entry point.")
+        if node_name not in self._nodes:
+            raise ValueError(f"Entry point node '{node_name}' not registered in the system.")
+        self._entry_node = node_name
+        
+    def set_end_node(self, node_name: str):
         """Sets a node as the end node of the LangGraph workflow."""
+        if not isinstance(node_name,str) or not node_name.strip():
+            raise TypeError("The entry point name should be a non-empty string.")
+        if self._entry_node:
+            raise ValueError(f"Node :{self._entry_node} is already set as entry point.")
         if node_name not in self._nodes:
             raise ValueError(f"End node '{node_name}' not registered in the system.")
-        self._graph.set_end_point(self._nodes[node_name].func) # Set LangGraph end point
-        logger.info(f"Set node '{node_name}' as workflow end point.")
+        self._end_point = node_name 
 
     def compile(self,**kwargs):
         """Compiles the LangGraph graph to finalize the workflow definition."""
@@ -278,55 +490,4 @@ class System:
             raise e
             print(f"Error while generating Mermaid diagram: {e}")
 
-    async def register4agent(self,name: str, 
-                    endpoint: Optional[str] = None, 
-                    api_key: Optional[str] = None,
-                    repo_url: Optional[str] = None):
-        
-        # if name in self._registry.get_agent_names():
-        #     raise ValueError(f"Agent '{name}' is already registered.")
-        
-        if not endpoint and not repo_url:
-            raise ValidationError("Agent must have either an endpoint or repository URL")
-        
-        if endpoint and repo_url:
-            raise ValidationError("Agent cannot have both an endpoint and repository URL")
-        
-        if endpoint:
-            agent_type = "MCP"
-            
-        elif repo_url:
-            agent_type = "LOCAL"
-            
-        try:
-            await self._registry.add_agent_package(name, agent_type, endpoint, api_key, repo_url)
-            
-        except Exception as e :
-            raise e
     
-    async def register4tool(self,name: str, 
-                    endpoint: Optional[str] = None, 
-                    api_key: Optional[str] = None,
-                    repo_url: Optional[str] = None):
-        
-        if not endpoint and not repo_url:
-            raise ValidationError("Tool must have either an endpoint, repository URL")
-        
-        if endpoint and repo_url:
-            raise ValidationError("Tool cannot have both an endpoint and repository URL")
-        
-        
-        # if name in self._registry.get_tool_names():
-        #     raise ValueError(f"Tool '{name}' is already registered.")
-
-        if endpoint:
-            tool_type = "MCP"
-            
-        elif repo_url:
-            tool_type = "LOCAL"
-            
-        try:
-            await self._registry.add_tool_package(name, tool_type, endpoint, api_key, repo_url)
-        
-        except Exception as e:
-            raise e

@@ -1,85 +1,177 @@
-import ray
-import httpx
-import asyncio
-import numpy as np
-from typing import Dict, Any, List, Optional
-from ray.util.collective import allreduce
+from typing import Dict, Any, List, Union, Callable, Optional, Tuple
 from sentence_transformers import SentenceTransformer
+import numpy as np
+from dataclasses import dataclass
+import torch
+from enum import Enum
+import logging
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
+from functools import lru_cache
 
+class EdgeType(Enum):
+    DIRECT = "direct"
+    CONDITIONAL = "conditional"
+
+@dataclass
+class Edge:
+    from_node: str
+    to_node: Union[str, List[str]]
+    edge_type: EdgeType
+    condition: Optional[str] = None
+    
 class Router:
-    def __init__(self, model_registry: Dict[str, Any], use_ray: bool = True):
+    def __init__(
+        self,
+        from_node: str,
+        to_node: Optional[str] = None,
+        direct_nodes: Optional[List[str]] = None,
+        conditional_nodes: Optional[Dict[str, str]] = None,
+        use_embeddings: bool = False,
+        embedding_model: Optional[Any] = None,
+        router_type: Optional[EdgeType] = EdgeType.DIRECT,
+    ):
         """
-        Router class implementing MCP with efficient communication.
+        Initialize the Router with source node and destination nodes configuration.
         
-        :param model_registry: Dictionary mapping model names to their respective endpoints or Ray actors.
-        :param use_ray: Whether to use Ray for distributed processing.
+        Args:
+            from_node (str): Source node name
+            to_nodes (Union[str, List[Union[Tuple[Dict[str, str], List[str]], str]]]): 
+                - If str: Single destination node (direct routing)
+                - If List: List of either strings (direct routing) or tuples (conditional routing)
+                    where tuple is (conditions_dict, target_nodes)
+            use_embeddings (bool): Whether to use embeddings for similarity-based routing
+            embedding_model: Pre-initialized embedding model (optional)
+            device (str): Device to run embeddings on
+            cache_size (int): Size of the LRU cache for embeddings
         """
-        self.model_registry = model_registry  # Maps model names to endpoints/actors
-        self.embedding_model = SentenceTransformer("all-MiniLM-L6-v2")  # Embedding model
-        self.use_ray = use_ray
-        if use_ray:
-            ray.init(ignore_reinit_error=True)
+        self.logger = logging.getLogger(__name__)
+        self.from_node = from_node
+        self.use_embeddings = use_embeddings
+        # Initialize edges
+        self.router_type = router_type
+        self.edges: List[Edge] = []
+        self._initialize_edges(to_node, direct_nodes, conditional_nodes)
         
-    async def route_request(self, query: str, transport: str = "auto", top_k: int = 1) -> Any:
-        """
-        Routes a request based on the query semantics and transport type.
+        # Initialize embedding related attributes if needed
+        if use_embeddings:
+            self.embedding_model = embedding_model 
+            self._node_embeddings = {}
+            # self._compute_node_embeddings()
         
-        :param query: The input query string.
-        :param transport: The communication mode ("http", "ray", "local", "auto").
-        :param top_k: Number of top relevant models to consider.
-        :return: Response from the routed model(s).
-        """
-        best_models = self._find_best_models(query, top_k)
+    def _initialize_edges(
+        self,
+        to_node: Optional[str],
+        direct_nodes: Optional[List[str]],
+        conditional_nodes: Optional[Dict[str, str]]
+    ) -> None:
+        """Initialize edges based on the provided configuration."""
+        if to_node:
+            self.edges.append(Edge(
+                from_node=self.from_node,
+                to_node=to_node,
+                edge_type=EdgeType.DIRECT
+            ))
+            self.router_type = EdgeType.DIRECT
+            return
+
+        if direct_nodes:
+            for node in direct_nodes:
+                self.edges.append(Edge(
+                    from_node=self.from_node,
+                    to_node=node,
+                    edge_type=EdgeType.DIRECT
+                ))
+            self.router_type = EdgeType.DIRECT
+            return 
         
-        if not best_models:
-            raise ValueError("No suitable models found for the given query.")
+        # Handle conditional nodes
+        if conditional_nodes:
+            for condition, target_node in conditional_nodes.items():
+                self.edges.append(Edge(
+                    from_node=self.from_node,
+                    to_node=target_node,
+                    edge_type=EdgeType.CONDITIONAL,
+                    condition= condition
+                ))
+            self.router_type = EdgeType.CONDITIONAL
+            return 
+
+    def get_routing_function(self) -> Callable:
+        """Return a routing function for use with LangGraph."""
+        if self.router_type == EdgeType.DIRECT:
+            raise ValueError("Direct routing is not supported in this context.")
         
-        if transport == "auto":
-            transport = self._choose_best_transport(best_models)
-        
-        responses = []
-        for model_name in best_models:
-            if transport == "http":
-                responses.append(await self._http_request(self.model_registry[model_name], query))
-            elif transport == "ray":
-                responses.append(await self._ray_request(self.model_registry[model_name], query))
-            else:  # Default to local function calls
-                responses.append(self.model_registry[model_name](query))
-        
-        return responses if len(responses) > 1 else responses[0]
+        conditional_nodes = {edge.condition: edge.to_node for edge in self.edges} # {"web":"websearch","email": "email-hanlder", "type": "type-checker"}
+                
+        def routing_function(state, _condition_space = conditional_nodes) -> Union[str, List[str]]:
+            current_node_result = state.get(self.from_node).get("_next")
+                    
+            if current_node_result is None:
+                raise ValueError(f"No result found for node {self.from_node}")
+            
+            _route_to = []
+            try:
+                for val in current_node_result:# ["web", "email"]:
+                    _route_to.append(_condition_space[val])
+                    
+            except KeyError as e:
+                raise ValueError(f"Condition {val} not found in routing conditions. {_condition_space}") from e
+            
+            if _route_to:
+                return _route_to
+            
+            raise ValueError(f"No next node for routing found.")
+            
+        return routing_function
     
-    def _find_best_models(self, query: str, top_k: int) -> List[str]:
-        """Finds the best model(s) based on embedding similarity."""
-        query_embedding = self.embedding_model.encode(query)
-        model_scores = {}
-        for model_name in self.model_registry:
-            model_embedding = self.embedding_model.encode(model_name)
-            similarity = np.dot(query_embedding, model_embedding) / (np.linalg.norm(query_embedding) * np.linalg.norm(model_embedding))
-            model_scores[model_name] = similarity
+
+
+    # def __del__(self):
+    #     """Cleanup resources."""
+    #     self.thread_pool.shutdown(wait=False)
+    
+    # @lru_cache(maxsize=1000)
+    # def _compute_embedding(self, text: str) -> np.ndarray:
+    #     """Compute and cache embeddings for a given text."""
+    #     with torch.no_grad():
+    #         embedding = self.embedding_model.encode(
+    #             text,
+    #             convert_to_tensor=True,
+    #             device=self.device
+    #         )
+    #         return embedding.cpu().numpy()
+
+    # def _compute_node_embeddings(self) -> None:
+    #     """Pre-compute embeddings for all node names."""
+    #     if not self.use_embeddings:
+    #         return
+            
+    #     unique_nodes = set()
+    #     for edge in self.edges:
+    #         if isinstance(edge.to_nodes, list):
+    #             unique_nodes.update(edge.to_nodes)
+    #         else:
+    #             unique_nodes.add(edge.to_nodes)
+                
+    #     for node in unique_nodes:
+    #         self._node_embeddings[node] = self._compute_embedding(node)
+
+    # def _compute_similarity(
+    #     self,
+    #     text_embedding: np.ndarray,
+    #     node_embeddings: Dict[str, np.ndarray]
+    # ) -> Dict[str, float]:
+    #     """Compute cosine similarity between text and node embeddings."""
+    #     similarities = {}
+    #     text_embedding_norm = np.linalg.norm(text_embedding)
         
-        sorted_models = sorted(model_scores, key=model_scores.get, reverse=True)
-        return sorted_models[:top_k]
-    
-    def _choose_best_transport(self, models: List[str]) -> str:
-        """Chooses the best transport mode dynamically."""
-        # Here, we could implement a more sophisticated decision-making process
-        # For now, prefer Ray if available, otherwise HTTP
-        return "ray" if self.use_ray else "http"
-    
-    async def _http_request(self, endpoint: str, query: str) -> Any:
-        """Sends an HTTP request asynchronously."""
-        async with httpx.AsyncClient() as client:
-            response = await client.post(endpoint, json={"query": query})
-            return response.json()
-    
-    async def _ray_request(self, actor: ray.actor.ActorHandle, query: str) -> Any:
-        """Sends a request to a Ray actor using Ray collective communication."""
-        result = await actor.handle_query.remote(query)
-        return result
-    
-    def distributed_reduce(self, tensor: np.ndarray) -> np.ndarray:
-        """Performs an all-reduce operation across Ray actors for distributed consensus."""
-        if not self.use_ray:
-            raise RuntimeError("Ray must be enabled for distributed reduction.")
-        allreduce(tensor)
-        return tensor  # The updated reduced tensor
+    #     for node, node_embedding in node_embeddings.items():
+    #         node_embedding_norm = np.linalg.norm(node_embedding)
+    #         similarity = np.dot(text_embedding, node_embedding) / (
+    #             text_embedding_norm * node_embedding_norm
+    #         )
+    #         similarities[node] = float(similarity)
+            
+    #     return similarities
+
