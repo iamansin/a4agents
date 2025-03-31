@@ -17,9 +17,9 @@ from enum import Enum, auto
 from pydantic import BaseModel
 #self Imports
 from a4agents_core.Utils._Singleton import Singleton
-from Registry.BaseRegistry import Registry, ETYPES
+from Registry.BaseRegistry import Registry, ETYPES, ToolValidationError
 from Router.Router import Router, EdgeType
-from Registry.Hanlder import AgentHandler, ToolHandler
+from Registry.Handlers import AgentHandler, ToolHandler
 
 logger = logging.getLogger(__name__)
 
@@ -142,12 +142,14 @@ class SystemNode:
 
 
 @Singleton(strict=True,thread_safe=True,debug=False)
+@dataclass(slots=True)
 class System:
     """A robust AI agent system integrated with LangGraph."""
     
-    _nodes :Dict[str , SystemNode]= {}  #-> {"node_name" : SystemNode() , ....}
-    _routers :Dict[str, List[Router]] = {} #-> {"from_node" : [Router() ,....]}
-    _routing_dict :Dict[str, Dict[str,str]]= {} #-> {}
+    _nodes :Dict[str , SystemNode]= {}  # {"node_name" : SystemNode() , ....}
+    _routers :Dict[str, List[Router]] = {} # {"from_node" : [Router() ,....]}
+    _routing_dict :Dict[str, Dict[str,str]]= {} # {"from_node" : {"to_node": "Direct"/"Conditional"}}
+    _tools : Dict[str,str] = {}
     _resource_distribution_map = {}
     _registry = Registry()
     _entry_node = None
@@ -168,7 +170,8 @@ class System:
             self._embedding_model = embedding_model
         
     @classmethod
-    def node(cls, name: Optional[str] = None, 
+    def node(cls, 
+             name: Optional[str] = None, 
              func: Optional[Callable] = None, 
              resources: Optional[Dict[str, Any]] = None, 
              scale :bool =False,):
@@ -283,7 +286,7 @@ class System:
             raise RouteValidationError(f"Error creating router from '{from_node}' to '{to_multiple_nodes}': {str(e)}") from e
     
     @classmethod
-    def add_conditional_route(self, from_node: str, 
+    def add_conditional_route(cls, from_node: str, 
                               to_node : Optional[Dict[str,str]] = None,
                               to_multiple_nodes: Optional[List[Dict[str, str]]] = None, 
                               use_model_routing :bool = False
@@ -298,7 +301,7 @@ class System:
             raise RouteValidationError("Must Provide either single node name or a List containing multiple node names.")
         if to_node and to_multiple_nodes:
             raise RouteValidationError("Provide either single node name or a List containing multiple node names.")
-        if from_node not in self._nodes:
+        if from_node not in cls._nodes:
             raise ValueError(f"From node '{from_node}' not registered in the system.")
         
         _node_dict : Dict = to_node if to_node else to_multiple_nodes
@@ -307,50 +310,56 @@ class System:
                 raise TypeError(f"Condition name '{condition}' must be a non-empty string.")
             if not isinstance(node, str) or not node.strip():
                 raise TypeError(f"Node name '{node}' must be a non-empty string.")
-            if node not in self._nodes:
+            if node not in cls._nodes:
                 raise ValueError(f"No Node with name {node} found in the System!")
             if node == from_node and not allow_self_loop:
                 raise SelfLoopCondition(f"Node '{from_node}' is routing to itself. May cause infinite loop.")
-            if node in self._routing_dict[from_node]:
+            if node in cls._routing_dict[from_node]:
                 raise RouteValidationError(f"Route from '{from_node}' to '{node}' already exists.")
 
         try:
             _router = Router(from_node=from_node, 
                              conditional_nodes=_node_dict, 
                              use_embeddings= use_model_routing,
-                             embedding_model= self._embedding_model if use_model_routing else None,
+                             embedding_model= cls._embedding_model if use_model_routing else None,
                              router_type= EdgeType.CONDITIONAL,
                             )
-            if self._routers.get(from_node,None) is not None:
-                self._routers[from_node].append(_router)
+            if cls._routers.get(from_node,None) is not None:
+                cls._routers[from_node].append(_router)
             else:
-                self._routers[from_node] = [_router]
+                cls._routers[from_node] = [_router]
         except Exception as e:
             raise RouteValidationError(f"Error creating router from '{from_node}' to '{_node_dict}': {str(e)}") from e
     
     @classmethod
-    def tool(self, 
+    def tool(cls,
             tool_name :str, 
-            tool_func :Optional[Callable] = None,):
+            tool_func :Optional[Callable] = None,
+            resources: Optional[Dict[str, Any]] = None):
         """This method is used to add tools into the system."""
         
         def register_tool(tool_func:Union[Callable]):
             
             if tool_name is None or not isinstance(tool_name, str) or not tool_name.strip():
                 raise TypeError("Tool name must be a non-empty string.")
-            if tool_name in self._nodes:
+            if tool_name in cls._nodes:
                 raise ValueError(f"A Node with name {tool_name} already exists.")
             
-            if not self._registry.get_tool(tool_name):
+            if not cls._registry.get_tool(tool_name):
                 raise ValueError(f"The Tool {tool_name} already exists in the Registry.")
             
             if not isinstance(tool_func,Callable):
                 raise ValueError("The tool_func should be a type of Callable function.")
             
             try:
-                self._registry.add_tool(tool_name, 
+                cls._registry.add_tool(tool_name, 
                                         tool_func,
                                         tool_type=ETYPES.CUSTOM)
+                
+                cls.node(name=tool_name,
+                        func= tool_func,
+                        resources = resources)
+                
             except Exception as e:
                 raise e
         
@@ -362,29 +371,27 @@ class System:
         
         return decorator
     
-    async def register4tool(self,name: str, 
-                    endpoint: Optional[str] = None, 
-                    api_key: Optional[str] = None,
-                    repo_url: Optional[str] = None):
+    #Here add a method for api validation.
+    #Here we have to add the logic for lazy loading.
+    async def register4tool(cls,
+                            tool_name: str, 
+                            endpoint: Optional[str] = None, 
+                            api_key: Optional[str] = None,
+                            repo_url: Optional[str] = None):
         
-        if not endpoint and not repo_url:
-            raise ValidationError("Tool must have either an endpoint, repository URL")
-        
+        if not tool_name or not isinstance(tool_name, str):
+            raise ValidationError("Tool name must be a non-empty string")
+        if tool_name in cls._tools:
+            raise ToolValidationError(f"Tool with name {tool_name} already exists.")
+        if not any(endpoint,repo_url): 
+            raise ToolValidationError("Tool must have either an endpoint, repository URL")
         if endpoint and repo_url:
             raise ValidationError("Tool cannot have both an endpoint and repository URL")
-        
-        
-        # if name in self._registry.get_tool_names():
-        #     raise ValueError(f"Tool '{name}' is already registered.")
 
-        if endpoint:
-            tool_type = "MCP"
-            
-        elif repo_url:
-            tool_type = "LOCAL"
+        tool_type : ETYPES = ETYPES.REMOTE if endpoint else ETYPES.LOCAL
             
         try:
-            await self._registry.add_tool_package(name, tool_type, endpoint, api_key, repo_url)
+            _partial_handler = await cls._registry.add_tool(name, tool_type, endpoint, api_key, repo_url)
         
         except Exception as e:
             raise e

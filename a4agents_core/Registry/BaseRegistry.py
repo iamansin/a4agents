@@ -19,7 +19,7 @@ from urllib.parse import urlparse
 
 from .WheelInstaller import WheelInstaller
 from Utils._Singleton import Singleton
-
+from .Handlers import ToolHandler, AgentHandler, ETYPES, ToolHandlerError
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -28,24 +28,13 @@ logging.basicConfig(
 logger = logging.getLogger("Registry")
 
 # Constants
-REGISTRY_FILE = "registry.json"
-REGISTRY_DIR = "Registry"
-TOOLS_DIR = os.path.join(REGISTRY_DIR, "Tools")
-AGENTS_DIR = os.path.join(REGISTRY_DIR, "Agents")
-BASE_VENV_DIR = os.path.join(REGISTRY_DIR, "venv")
 
-
-class MCPTYPES(Enum):
-    LOCAL = "LOCAL"
-    REMOTE = "REMOTE"
-    
-class ETYPES(Enum):
-    CUSTOM = "CUSTOM"
-    MCP = "MCP"
-    
     
 class ValidationError(Exception):
     """Custom exception for validation errors in the registry."""
+    pass
+
+class ToolCreationError(Exception):
     pass
 
 # Here we are expecting the Registry to act as a Singelton type of object, 
@@ -62,21 +51,24 @@ class Registry:
     It also provides methods to check for the existence of tools and agents in
     remote repositories or endpoints.
     """
-    
-    def __init__(self):
-        """Initialize the Registry."""
-        # Create necessary directories
-        os.makedirs(TOOLS_DIR, exist_ok=True)
-        os.makedirs(AGENTS_DIR, exist_ok=True)
+    REGISTRY_FILE = "registry.json"
+    REGISTRY_DIR = "Registry"
+    TOOLS_DIR = os.path.join(REGISTRY_DIR, "Tools")
+    AGENTS_DIR = os.path.join(REGISTRY_DIR, "Agents")
+    BASE_VENV_DIR = os.path.join(REGISTRY_DIR, "venv")
+    os.makedirs(TOOLS_DIR, exist_ok=True)
+    os.makedirs(AGENTS_DIR, exist_ok=True)
         
         # Initialize registry file if it doesn't exist
-        if not os.path.exists(REGISTRY_FILE):
-            with open(REGISTRY_FILE, "w") as f:
+    if not os.path.exists(REGISTRY_FILE):
+        with open(REGISTRY_FILE, "w") as f:
                 json.dump({"tools": {}, "agents": {}}, f)
         
+    _lock = asyncio.Lock()  # Lock for thread-safe operations
+    wheel_installer = WheelInstaller(base_venv_dir=BASE_VENV_DIR)
+    
+    def __init__(self):
         self._load_registry()
-        self._lock = asyncio.Lock()  # Lock for thread-safe operations
-        self.wheel_installer = WheelInstaller(base_venv_dir=BASE_VENV_DIR)
         
     def _load_registry(self) -> None:
         """Load the registry from the registry file."""
@@ -141,40 +133,46 @@ class Registry:
             "agents": list(self.registry["agents"].keys())
         }
         
-    async def add_tool(self, 
+    #here we have to use lazy downloading and creation of the handlers at the time of compilation
+    @classmethod
+    async def add_tool(cls, 
                     name: str, 
                     tool_type: str, 
+                    func : Optional[callable] = None,
                     endpoint: Optional[str] = None, 
                     api_key: Optional[str] = None,
                     repo_url: Optional[str] = None) -> ToolHandler:
         
         
-        if tool_type == ETYPES.MCP:
+        if tool_type == ETYPES.REMOTE:
             try:
-                # Validate inputs based on tool type before acquiring any locks
-                if tool_type == MCPTYPES.REMOTE:
-                    if not endpoint:
-                        raise ValidationError("MCP tools must have an endpoint")
-                    
-                    # Validate the endpoint URL format and accessibility
-                    await self._validate_endpoint(endpoint, api_key)
-                    
-                elif tool_type == MCPTYPES.LOCAL:
-                    parsed_url = urlparse(repo_url)
-                    path_parts = parsed_url.path.strip('/').split('/')
-                    owner, repo = path_parts[0], path_parts[1]
-                    repo_dir = os.path.join(TOOLS_DIR, repo)
-                        # Clone the repository only after confirming YAML exists
-                    package_path = await self._clone_repo_async(repo_url, repo_dir)
-                    venv_path, executable_path = await self.wheel_installer.install_wheel(package_path)
-                        
-                else:
-                    raise ValidationError(f"Unsupported tool type: {tool_type}")
+                await cls._validate_endpoint(endpoint, api_key)
 
-                # Create the ToolHandler instance
-                tool = ToolHandler(
+            except Exception as e:
+                raise ToolHandlerError(f"There was some error while validating endpoint and api-key : {str(e)}") from e
+            
+        elif tool_type == ETYPES.LOCAL:
+            try:
+                parsed_url = urlparse(repo_url)
+                path_parts = parsed_url.path.strip('/').split('/')
+                _owner, repo = path_parts[0], path_parts[1]
+                repo_dir = os.path.join(cls.TOOLS_DIR, repo)
+                # Clone the repository only after confirming YAML exists
+                package_path = await cls._clone_repo_async(repo_url, repo_dir)
+                venv_path, executable_path = await cls.wheel_installer.install_wheel(package_path)
+                
+            except Exception as e:
+                # Clean up resources on error
+                if os.path.exists(repo_dir):
+                    shutil.rmtree(repo_dir)
+                raise ToolHandlerError(f"There was some problem while creating Local tool : {str(e)}") from e
+            
+        
+        # Create the ToolHandler instance
+        toolhandler = ToolHandler(
                     name=name,
-                    tool_type=tool_type,
+                    tool_type = tool_type,
+                    func=func,
                     endpoint=endpoint,
                     api_key=api_key,
                     venv_path = venv_path,
@@ -182,28 +180,16 @@ class Registry:
                     dir = repo_dir
                 )
                 
-                if self._executor:
-                    tool.set_executor(self._executor)
                 # Only lock when updating the registry
-                async with self._lock:
+        async with cls._lock:
                     # Double-check the tool doesn't exist (in case of race condition)
-                    if name in self.registry["tools"]:
-                        raise ValueError(f"Tool '{name}' is already registered.")
+            if name in cls.registry["tools"]:
+                raise ValueError(f"Tool '{name}' is already registered.")
                     
-                    self.registry["tools"][name] = tool.to_dict()
-                    self._save_registry()
+            cls.registry["tools"][name] = toolhandler.to_dict()
+            cls._save_registry()
                 
-                return 
-            
-            except Exception as e:
-                # Clean up resources on error
-                if os.path.exists(repo_dir):
-                    shutil.rmtree(repo_dir)
-                
-                if isinstance(e, ValidationError):
-                    raise
-                else:
-                    raise ValidationError(f"Failed to add tool '{name}': {str(e)}")
+        return toolhandler
     
     async def add_agent(self, 
                     name: str, 

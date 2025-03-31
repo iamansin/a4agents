@@ -3,17 +3,21 @@ import logging
 import json
 import os
 import httpx
-from enum import Enum
+from enum import Enum, auto
 from typing import Dict, Any, Optional, Union, List, TypeVar, cast
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 import time
+from abc import abstractmethod, ABC
+
+from Runner import PackageExecutor
 
 T = TypeVar('T')
-
+    
 class ETYPES(Enum):
-    MCP_LOCAL = "Local"
-    MCP_REMOTE = "Remote"
+    CUSTOM = auto()
+    LOCAL = auto()
+    REMOTE = auto()
     
 class ValidationError(Exception):
     """Custom exception for validation errors in the registry."""
@@ -23,8 +27,22 @@ class ExecutionError(Exception):
     """Custom exception for execution errors."""
     pass
 
+class ToolHandlerError(Exception):
+    pass
+
+class BaseObjectHandler(ABC):
+    
+    def __post_init__(self) -> None:
+        """Post-initialization method for validation."""
+        pass
+    
+    @abstractmethod
+    def execute(self, state: Dict[str, Any], method: Optional[str] = None) -> Dict[str, Any]:
+        """Execute the handler with the given state."""
+        pass
+
 @dataclass(slots=True)
-class ToolHandler:
+class ToolHandler(BaseObjectHandler):
     """
     Class to handle and store details about tools.
     
@@ -39,33 +57,30 @@ class ToolHandler:
     """
     name: str
     tool_type: str
+    func : Optional[callable] = None
     endpoint: Optional[str] = None
     api_key: Optional[str] = None
     venv_path: Optional[str] = None
     entry_point: Optional[str] = None
     dir: Optional[str] = None
-    _executor: Optional[Any] = field(default=None, repr=False, compare=False)
     _logger: logging.Logger = field(default_factory=lambda: logging.getLogger("ToolHandler"), repr=False, compare=False)
     _http_client: Optional[httpx.AsyncClient] = field(default=None, repr=False, compare=False)
     
     def __post_init__(self) -> None:
         """Validate the ToolHandler attributes after initialization."""
-        if not self.name or not isinstance(self.name, str):
-            raise ValidationError("Tool name must be a non-empty string")
         
-        if not self.tool_type or not isinstance(self.tool_type, str):
-            raise ValidationError("Tool type must be a non-empty string")
-        
-        if self.tool_type == ETYPES.MCP_REMOTE.value and not self.endpoint:
+        if self.tool_type == ETYPES.REMOTE and not self.endpoint:
             raise ValidationError("MCP Remote tool must have an endpoint")
             
-        if self.tool_type == ETYPES.MCP_LOCAL.value:
+        if self.tool_type == ETYPES.LOCAL:
             if not self.venv_path:
                 raise ValidationError("Local tool must have a virtual environment path")
             if not self.entry_point:
                 raise ValidationError("Local tool must have an entry point")
             if not self.dir:
                 raise ValidationError("Local tool must have a directory path")
+            
+            self._executor = PackageExecutor(path)
                 
             # Convert string paths to Path objects for validation
             venv_path = Path(self.venv_path)
@@ -109,9 +124,9 @@ class ToolHandler:
         start_time = time.time()
         
         try:
-            if self.tool_type == ETYPES.MCP_LOCAL.value:
+            if self.tool_type == ETYPES.LOCAL.value:
                 return await self._execute_local(state, method)
-            elif self.tool_type == ETYPES.MCP_REMOTE.value:
+            elif self.tool_type == ETYPES.REMOTE.value:
                 return await self._execute_remote(state, method)
             else:
                 raise ValidationError(f"Unsupported tool type: {self.tool_type}")
@@ -226,7 +241,7 @@ class ToolHandler:
 
 
 @dataclass(slots=True)
-class AgentHandler:
+class AgentHandler(BaseObjectHandler):
     """
     Class to handle and store details about agents.
     
@@ -257,10 +272,10 @@ class AgentHandler:
         if not self.agent_type or not isinstance(self.agent_type, str):
             raise ValidationError("Agent type must be a non-empty string")
         
-        if self.agent_type == ETYPES.MCP_REMOTE.value and not self.endpoint:
+        if self.agent_type == ETYPES.REMOTE and not self.endpoint:
             raise ValidationError("MCP Remote Agent must have an endpoint")
 
-        if self.agent_type == ETYPES.MCP_LOCAL.value:
+        if self.agent_type == ETYPES.LOCAL.value:
             if not self.venv_path:
                 raise ValidationError("Local agent must have a virtual environment path")
             if not self.entry_point:
