@@ -1,4 +1,5 @@
 from typing_extensions import (
+    Literal,
     Callable, 
     Optional,
     Dict,
@@ -15,11 +16,16 @@ from dataclasses import dataclass, field
 import functools
 from enum import Enum, auto
 from pydantic import BaseModel
+from urllib.parse import urlparse
+import warnings
+import aiohttp
+import asyncio
 #self Imports
 from a4agents_core.Utils._Singleton import Singleton
-from Registry.BaseRegistry import Registry, ETYPES, ToolValidationError
+from Registry.BaseRegistry import Registry, ETYPES, ToolValidationError, ToolCreationError
 from Router.Router import Router, EdgeType
 from Registry.Handlers import AgentHandler, ToolHandler
+from GraphCompiler import DynamicGraphCompiler
 
 logger = logging.getLogger(__name__)
 
@@ -43,20 +49,33 @@ class NodeType(Enum):
     TOOL = auto()
     AGENT = auto()
     
+@dataclass(slots=True)
+class ETool:
+    tool_type : Literal[ETYPES.LOCAL, ETYPES.REMOTE]
+    func : Optional[Callable] = None
+    repo_url : Optional[str] = None
+    endpoint : Optional[str] = None
+    api_key : Optional[str] = None
 
+@dataclass(slots=True)
+class EAgent:
+    agent_type : Literal[ETYPES.LOCAL, ETYPES.REMOTE]
+    func : Optional[Callable] = None
+    repo_url : Optional[str] = None
+    endpoint : Optional[str] = None
+    api_key : Optional[str] = None
+    
 @dataclass(frozen=True, slots=True)
 class SystemNode:
     """Encapsulates a node in the LangGraph System with enhanced performance using slots."""
-
     name: str
     node_type: NodeType
     function: Optional[Callable] = None
     handler: Optional[Any] = None  # ToolHandler or AgentHandler
-    scale: bool 
+    scale: bool = False
     resources: Dict[str, Any] = field(default_factory=dict)
-    if scale:
-        task = ray.remote(function)
-    
+    task: Optional[Any] = field(default=None, init=False, compare=False) # To store the remote function
+
     def __post_init__(self):
         """Validate the node configuration and set up Ray task if scaling is enabled."""
         # Validate function or handler based on node type
@@ -68,12 +87,12 @@ class SystemNode:
 
         logger.info(f"SystemNode '{self.name}' initialized as {self.node_type.name}")
 
-# Here get_callable() method returns a wrapper which encapsulates the 
-# original logic for execution of the particular node type.
-# We are creating a wrapper here so as to provide an additional functionality,
-# this wrapper takes state as an argument and returns the state after node execution.
-# The state is updated based on the node result rather then keyword this decreases KeyNotFound error.
-# as well as provides flexibility to us.
+    # Here get_callable() method returns a wrapper which encapsulates the 
+    # original logic for execution of the particular node type.
+    # We are creating a wrapper here so as to provide an additional functionality,
+    # this wrapper takes state as an argument and returns the state after node execution.
+    # The state is updated based on the node result rather then keyword this decreases KeyNotFound error.
+    # as well as provides flexibility to us.`
     def get_callable(self) -> Callable:
         """
         Returns a callable function suitable for use in LangGraph.
@@ -149,7 +168,8 @@ class System:
     _nodes :Dict[str , SystemNode]= {}  # {"node_name" : SystemNode() , ....}
     _routers :Dict[str, List[Router]] = {} # {"from_node" : [Router() ,....]}
     _routing_dict :Dict[str, Dict[str,str]]= {} # {"from_node" : {"to_node": "Direct"/"Conditional"}}
-    _tools : Dict[str,str] = {}
+    _lazy_tools : Dict[str,ETool] = {}
+    _lazy_agents : Dict[str,EAgent] = {}
     _resource_distribution_map = {}
     _registry = Registry()
     _entry_node = None
@@ -170,7 +190,7 @@ class System:
             self._embedding_model = embedding_model
         
     @classmethod
-    def node(cls, 
+    def add_node(cls, 
              name: Optional[str] = None, 
              func: Optional[Callable] = None, 
              resources: Optional[Dict[str, Any]] = None, 
@@ -191,12 +211,10 @@ class System:
 
         def register_node(func: Callable):
             """Inner function to handle function registration logic."""
-            if not callable(func):
-                raise TypeError(f"Expected a callable function, got {type(func).__name__}")
-
             if not isinstance(name, str) or not name.strip():
                 raise ValueError("Node name must be a non-empty string.")
-
+            if not callable(func):
+                raise TypeError(f"Expected a callable function, got {type(func).__name__}")
             if name in cls._nodes:
                 raise  NodeCreationError(f"Node name '{name}' already exists in system '{cls.name}'.")
 
@@ -226,25 +244,6 @@ class System:
             return register_node(func)
 
         return decorator
-    
-    def nodes_from_dict(self, func_dict: Dict[str, Tuple[Callable, Optional[Dict[str, Any]]]]):
-        """
-        Adds multiple functions as SystemNodes from a dictionary.
-
-        :param func_dict: Dictionary where keys are node names and values are functions.
-        :param resources: Optional dictionary specifying resource allocation.
-        :raises TypeError: If func_dict is not a dictionary or contains invalid keys/values.
-        :raises ValueError: If any node name is already registered.
-        """
-        if not isinstance(func_dict, dict):
-            raise TypeError("Expected a dictionary with {name: function} mapping, but got {type(func_dict).__name__}")
-
-        for name, args in func_dict.items():
-            try:
-                self.node(name=name, func=args[0], resources= args[1] if len(args)>1 else None)
-            except Exception as e:
-                logger.error(f"Error adding node '{name}': {str(e)}")
-                raise
         
     @classmethod
     def add_route(cls, from_node: str, 
@@ -286,7 +285,8 @@ class System:
             raise RouteValidationError(f"Error creating router from '{from_node}' to '{to_multiple_nodes}': {str(e)}") from e
     
     @classmethod
-    def add_conditional_route(cls, from_node: str, 
+    def add_conditional_route(cls, 
+                              from_node: str, 
                               to_node : Optional[Dict[str,str]] = None,
                               to_multiple_nodes: Optional[List[Dict[str, str]]] = None, 
                               use_model_routing :bool = False
@@ -332,7 +332,7 @@ class System:
             raise RouteValidationError(f"Error creating router from '{from_node}' to '{_node_dict}': {str(e)}") from e
     
     @classmethod
-    def tool(cls,
+    def add_tool(cls,
             tool_name :str, 
             tool_func :Optional[Callable] = None,
             resources: Optional[Dict[str, Any]] = None):
@@ -342,26 +342,16 @@ class System:
             
             if tool_name is None or not isinstance(tool_name, str) or not tool_name.strip():
                 raise TypeError("Tool name must be a non-empty string.")
-            if tool_name in cls._nodes:
-                raise ValueError(f"A Node with name {tool_name} already exists.")
             
-            if not cls._registry.get_tool(tool_name):
-                raise ValueError(f"The Tool {tool_name} already exists in the Registry.")
-            
+            if tool_name in cls._lazy_tools:
+                raise ToolValidationError(f"Tool with name {tool_name} already exists in the Registry.")
+                
             if not isinstance(tool_func,Callable):
                 raise ValueError("The tool_func should be a type of Callable function.")
             
-            try:
-                cls._registry.add_tool(tool_name, 
-                                        tool_func,
-                                        tool_type=ETYPES.CUSTOM)
-                
-                cls.node(name=tool_name,
-                        func= tool_func,
-                        resources = resources)
-                
-            except Exception as e:
-                raise e
+            #manage Resources also (ray update)
+            cls._lazy_tools[tool_name] = ETool(tool_type = ETYPES.CUSTOM,
+                                           func = tool_func)
         
         if tool_func is not None:
             return register_tool(tool_func)
@@ -371,30 +361,74 @@ class System:
         
         return decorator
     
-    #Here add a method for api validation.
     #Here we have to add the logic for lazy loading.
-    async def register4tool(cls,
-                            tool_name: str, 
-                            endpoint: Optional[str] = None, 
-                            api_key: Optional[str] = None,
-                            repo_url: Optional[str] = None):
+    def add_etool(cls,
+                    tool_name: str, 
+                    endpoint: Optional[str] = None, 
+                    api_key: Optional[str] = None,
+                    repo_url: Optional[str] = None):
         
-        if not tool_name or not isinstance(tool_name, str):
+        if not isinstance(tool_name, str) or not tool_name.strip():
             raise ValidationError("Tool name must be a non-empty string")
         if tool_name in cls._tools:
-            raise ToolValidationError(f"Tool with name {tool_name} already exists.")
+            raise ToolValidationError(f"Tool with name {tool_name} already exists in the Registry.")
         if not any(endpoint,repo_url): 
             raise ToolValidationError("Tool must have either an endpoint, repository URL")
         if endpoint and repo_url:
-            raise ValidationError("Tool cannot have both an endpoint and repository URL")
-
-        tool_type : ETYPES = ETYPES.REMOTE if endpoint else ETYPES.LOCAL
-            
-        try:
-            _partial_handler = await cls._registry.add_tool(name, tool_type, endpoint, api_key, repo_url)
+            raise ToolValidationError("Tool cannot have both an endpoint and repository URL")
         
-        except Exception as e:
-            raise e
+        tool_type : ETYPES = ETYPES.REMOTE if endpoint else ETYPES.LOCAL
+
+        cls._lazy_tools[tool_name] = ETool(tool_type = tool_type,
+                                           repo_url =repo_url,
+                                           endpoint = endpoint,
+                                           api_key = api_key)
+    
+    @classmethod
+    def add_multiple_nodes(cls, node_dict: Dict[str, Tuple[Callable, Optional[Dict[str, Any]]]]):
+        """
+        Adds multiple functions as SystemNodes from a dictionary.
+
+        :param func_dict: Dictionary where keys are node names and values are functions.
+        :param resources: Optional dictionary specifying resource allocation.
+        :raises TypeError: If func_dict is not a dictionary or contains invalid keys/values.
+        :raises ValueError: If any node name is already registered.
+        """
+        if not isinstance(node_dict, dict):
+            raise TypeError(f"Expected a dictionary mapping, but got {type(func_dict).__name__}")
+
+        for name, args in node_dict.items():
+            try:
+                cls.add_node(name=name, func=args[0], resources= args[1] if len(args)>1 else None)
+            except Exception as e:
+                logger.error(f"Error adding node '{name}': {str(e)}")
+                raise
+    
+    @classmethod
+    def add_multiple_tools(cls, tool_dict : Dict[str, Tuple[Callable, Optional[Dict[str, Any]]]]) -> None:
+        
+        if not isinstance(tool_dict, dict):
+            raise TypeError(f"Expected a dictionary mapping, but got {type(func_dict).__name__}")
+
+        for name, args in tool_dict.items():
+            try:
+                cls.add_tool(name=name, func=args[0], resources= args[1] if len(args)>1 else None)
+            except Exception as e:
+                logger.error(f"Error adding node '{name}': {str(e)}")
+                raise
+
+    def add_multiple_etools(cls, etool_dict :Dict[str,Dict[str,str]]) -> None:
+        
+        if not isinstance(etool_dict, dict):
+            raise TypeError("Expected a dictionary with {name: function} mapping, but got {type(func_dict).__name__}")
+
+        # for name, args in etool_dict.items():
+        #     try:
+        #         cls.add_etool(name=name,
+        #                       endpoint=args.get(""))
+        #     except Exception as e:
+        #         logger.error(f"Error adding node '{name}': {str(e)}")
+        #         raise
 
     async def register4agent(self,
                             endpoint: Optional[str] = None, 
@@ -429,9 +463,155 @@ class System:
             raise ValueError(f"End node '{node_name}' not registered in the system.")
         self._end_point = node_name 
 
-    def compile(self,**kwargs):
+    async def _load_tools(
+        self,
+        _tools_list: Dict[str, ETool],
+        logger: Optional[logging.Logger] = None
+    ) -> Dict[str, ETool]:
+        """
+        Asynchronously loads all tools concurrently and returns dictionary of failed tools.
+        
+        Args:
+            _tools_list (Dict[str, ETool]): Dictionary mapping tool names to their configurations
+            logger (Optional[logging.Logger]): Logger instance for error tracking
+            
+        Returns:
+            Dict[str, ETool]: Dictionary of tools that failed to load
+        """
+        _failed_tools: Dict[str, ETool] = {}
+        
+        async def _process_single_tool(tool_name: str, etool: ETool) -> Tuple[str, Any]:
+            """Inner function to process a single tool and return its result."""
+            try:
+                tool_handler = await self._registry.add_tool(
+                    tool_type=etool.tool_type,
+                    func=etool.func,
+                    endpoint=etool.endpoint,
+                    api_key=etool.api_key,
+                    repo_url=etool.repo_url
+                )
+                return tool_name, tool_handler
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Failed to load tool {tool_name}: {str(e)}", exc_info=True)
+                return tool_name, e
+
+        # Start all tool loading tasks concurrently
+        tasks: List[asyncio.Task] = [
+            asyncio.create_task(_process_single_tool(tool_name, etool))
+            for tool_name, etool in _tools_list.items()
+        ]
+        
+        if logger:
+            logger.info(f"Started loading {len(tasks)} tools concurrently")
+
+        # Wait for all tasks to complete
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results
+        for (tool_name, result) in results:
+            if isinstance(result, Exception):
+                _failed_tools[tool_name] = _tools_list[tool_name]
+                warnings.warn(
+                    f"Tool {tool_name} failed to load: {str(result)}",
+                    RuntimeWarning
+                )
+                continue
+                
+            if not result or not isinstance(result, ToolHandler):
+                _failed_tools[tool_name] = _tools_list[tool_name]
+                warnings.warn(
+                    f"Invalid tool handler for {tool_name}. Got: {type(result)}",
+                    RuntimeWarning
+                )
+                continue
+                
+            # Store successfully created tool
+            self._nodes[tool_name] = SystemNode(
+                name=tool_name,
+                node_type=NodeType.TOOL,
+                handler=result
+            )
+
+        return _failed_tools
+
+    async def _load_lazy_tools(
+        self,
+        retry: bool = False,
+        logger: Optional[logging.Logger] = None
+    ) -> None:
+        """
+        Loads all lazy-initialized tools concurrently with optional retry.
+        
+        Args:
+            retry (bool): Whether to retry loading failed tools
+            logger (Optional[logging.Logger]): Logger instance for error tracking
+            
+        Raises:
+            ToolCreationError: If tools fail to load after retry
+            RuntimeError: If tools cannot be loaded even after retry
+        """
+        start_time = time.perf_counter
+        tools_list = self._lazy_tools.copy()
+        
+        if logger:
+            logger.info(f"Starting concurrent load of {len(tools_list)} tools")
+        
+        try:
+            # First attempt - load all tools concurrently
+            failed_tools = await self._load_tools(tools_list, logger)
+            
+            if failed_tools:
+                failed_count = len(failed_tools)
+                if logger:
+                    logger.warning(f"{failed_count} tools failed to load")
+                
+                # Retry failed tools if requested
+                if retry:
+                    if logger:
+                        logger.info(f"Retrying {failed_count} failed tools concurrently")
+                    
+                    _failed_tools = await self._load_tools(failed_tools, logger)
+                    
+                    if _failed_tools:
+                        failed_names = ", ".join(_failed_tools.keys())
+                        raise RuntimeError(
+                            f"Tools failed to load after retry: {failed_names}"
+                        )
+                
+        except Exception as e:
+            if logger:
+                logger.error(f"Critical error in tool loading: {str(e)}", exc_info=True)
+            raise ToolCreationError(f"Tool loading failed: {str(e)}") from e
+            
+        finally:
+            duration = time.perf_counter - start_time
+            if logger:
+                logger.info(
+                    f"Tool loading completed in {duration:.2f}s. "
+                    f"Success: {len(tools_list) - len(failed_tools)}, "
+                    f"Failed: {len(failed_tools)}"
+                )
+        
+    async def _load_lazy_agents():
+        pass
+    @classmethod
+    def compile(cls,**kwargs):
         """Compiles the LangGraph graph to finalize the workflow definition."""
-        Dynamic_Graph = DynamicGraphCompiler(self._nodes, self._router_mappings)
+        if cls._lazy_tools:
+            try:
+                cls._load_lazy_tools()
+            except Exception as e:
+                raise e
+            
+        if cls._lazy_agents:
+            try: 
+                cls._load_lazy_agents()
+            except Exception as e:
+                raise e
+            
+        Dynamic_Graph : CompiledGraphObj = DynamicGraphCompiler(cls._nodes, 
+                                                                cls._registry)._compile_graph
 
     def execute(self, start_node: str, data: Any, config: Optional[dict] = None): # Added LangGraph config
         """
@@ -497,4 +677,3 @@ class System:
             raise e
             print(f"Error while generating Mermaid diagram: {e}")
 
-    

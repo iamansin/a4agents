@@ -62,6 +62,7 @@ class ToolHandler(BaseObjectHandler):
     api_key: Optional[str] = None
     venv_path: Optional[str] = None
     entry_point: Optional[str] = None
+    package_path: Optional[str] = None
     dir: Optional[str] = None
     _logger: logging.Logger = field(default_factory=lambda: logging.getLogger("ToolHandler"), repr=False, compare=False)
     _http_client: Optional[httpx.AsyncClient] = field(default=None, repr=False, compare=False)
@@ -94,7 +95,7 @@ class ToolHandler(BaseObjectHandler):
     
     def set_executor(self, executor: Any) -> None:
         """Set the PackageExecutor instance for this handler."""
-        self._executor = executor
+        self._executor = executor 
     
     async def _get_http_client(self) -> httpx.AsyncClient:
         """Get or create an HTTP client for remote execution."""

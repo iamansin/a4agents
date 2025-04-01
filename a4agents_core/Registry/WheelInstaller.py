@@ -11,6 +11,9 @@ import subprocess
 from packaging.utils import parse_wheel_filename
 import venv
 
+class PATHError(Exception):
+    pass
+
 class WheelInstaller:
     def __init__(self, 
                  logger: Optional[logging.Logger] = None, 
@@ -104,7 +107,7 @@ class WheelInstaller:
             }
         }
 
-    async def install_wheel(self, wheel_path: Union[str, Path], force_reinstall: bool = False) -> Path:
+    async def install_wheel(self, wheel_path: Union[str, Path], package_name :str, force_reinstall: bool = False) -> Path:
         """
         Comprehensive wheel installation with cross-platform support.
         
@@ -125,7 +128,8 @@ class WheelInstaller:
         # Create isolated virtual environment
         self.logger.info("Now creating venv")
         venv_path = await self.create_venv(package_name)
-        
+        if not isinstance(venv_path,Path):
+            venv_path = Path(venv_path)
         # Get OS-specific configurations
         os_config = self.path_configs[self.os_type]
         bin_dir = venv_path / os_config['bin_dir']
@@ -148,11 +152,14 @@ class WheelInstaller:
         
         # Ensure PATH is always set
         self.logger.info("Now adding path and finding the Entry point...")
-        tasks = [self.ensure_path(venv_path) ,self._find_package_entry_point(venv_path)]
+        tasks = [self.ensure_path(venv_path) ,self._find_package_entry_point(venv_path, package_name)]
         try :
-            _ , executable_path = await asyncio.gather(*tasks, return_exceptions=True)
+            excpected_path_error , executable_path = await asyncio.gather(*tasks, return_exceptions=True)
         except Exception as e:
             raise e 
+        
+        if isinstance(excpected_path_error,Exception):
+            raise PATHError(f"Unable to set env PATH for the package : {package_name} as :{str(excpected_path_error)}")
         
         print(f"The executable file path is : {executable_path}")
         print(f"The venv path : {venv_path}")
@@ -327,7 +334,7 @@ class WheelInstaller:
         except Exception as e:
             self.logger.warning(f"Error during venv cleanup: {e}")
 
-    async def _find_package_entry_point(self, venv_path: Path) -> Optional[str]:
+    async def _find_package_entry_point(self, venv_path: Path, package_name :str) -> Optional[str]:
         """
         Find the main entry point for the installed package with improved precision.
         
@@ -362,5 +369,8 @@ class WheelInstaller:
                 script.name not in excluded_files
             ]
         
-        # Return the first matching executable, if any
-        return executable_scripts[0] if executable_scripts else None
+        for script in executable_scripts:
+            if script.lower() == package_name.lower():
+                return script
+        
+        return None

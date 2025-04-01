@@ -9,6 +9,7 @@ import json
 import shutil
 import asyncio
 import logging
+import warnings
 import importlib.util
 from typing import Dict, List, Optional, Union, Any, Tuple
 from pathlib import Path
@@ -35,6 +36,9 @@ class ValidationError(Exception):
     pass
 
 class ToolCreationError(Exception):
+    pass
+
+class FileCreationError(Exception):
     pass
 
 # Here we are expecting the Registry to act as a Singelton type of object, 
@@ -133,7 +137,6 @@ class Registry:
             "agents": list(self.registry["agents"].keys())
         }
         
-    #here we have to use lazy downloading and creation of the handlers at the time of compilation
     @classmethod
     async def add_tool(cls, 
                     name: str, 
@@ -157,32 +160,35 @@ class Registry:
                 path_parts = parsed_url.path.strip('/').split('/')
                 _owner, repo = path_parts[0], path_parts[1]
                 repo_dir = os.path.join(cls.TOOLS_DIR, repo)
-                # Clone the repository only after confirming YAML exists
                 package_path = await cls._clone_repo_async(repo_url, repo_dir)
-                venv_path, executable_path = await cls.wheel_installer.install_wheel(package_path)
+                if not isinstance(package_path, Path):
+                    package_path = Path(package_path)
+                    
+                venv_path, executable_path = await cls.wheel_installer.install_wheel(package_path, package_name = repo)
                 
             except Exception as e:
                 # Clean up resources on error
                 if os.path.exists(repo_dir):
                     shutil.rmtree(repo_dir)
                 raise ToolHandlerError(f"There was some problem while creating Local tool : {str(e)}") from e
-            
+        
+        #Here we are also considering the ETYPES.CUSTOM tools!
         
         # Create the ToolHandler instance
         toolhandler = ToolHandler(
                     name=name,
                     tool_type = tool_type,
-                    func=func,
-                    endpoint=endpoint,
+                    func=func, #if ETYPES.CUSTOM
+                    endpoint=endpoint,#if ETYPES.REMOTE
                     api_key=api_key,
-                    venv_path = venv_path,
-                    entry_point = executable_path,
+                    venv_path=venv_path,#if ETYPES.LOCAL
+                    executable_path = executable_path,
                     dir = repo_dir
                 )
                 
-                # Only lock when updating the registry
+        # Only lock when updating the registry
         async with cls._lock:
-                    # Double-check the tool doesn't exist (in case of race condition)
+            # Double-check the tool doesn't exist (in case of race condition)
             if name in cls.registry["tools"]:
                 raise ValueError(f"Tool '{name}' is already registered.")
                     
@@ -376,7 +382,59 @@ class Registry:
             raise e
 
         return True
-    
+
+    async def _clone_repo_async(self,
+                                 repo_url: str,
+                                 target_dir: str,
+                                 force_download: bool = False) -> None:
+        """
+        Clone a git repository asynchronously.
+
+        Args:
+            repo_url: URL of the git repository
+            target_dir: Directory to clone into
+
+        Raises:
+            ValidationError: If no .whl file is found or cloning fails.
+            FileCreationError: If there was a problem creating the target directory.
+        """
+        if os.path.exists(target_dir):
+            warnings.warn(f"Repo with URL : {repo_url}, already exists in Dir : {target_dir}")
+            if not force_download:
+                whl_files = list(Path(target_dir).rglob("*.whl"))
+                if not whl_files:
+                    raise ValidationError(f"No .whl file found in the {target_dir} directory.")
+                return str(whl_files[0])
+            else:
+                shutil.rmtree(target_dir)
+
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+        except OSError as e:
+            raise FileCreationError(f"Failed to create target directory '{target_dir}': {e}") from e
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                'git', 'clone', '--depth=1', repo_url, target_dir,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            _, stderr = await process.communicate()
+
+            if process.returncode != 0:
+                if os.path.exists(target_dir):
+                    shutil.rmtree(target_dir)
+                raise ValidationError(f"Failed to clone repository: {stderr.decode().strip()}")
+
+        except Exception as e:
+            raise FileCreationError(f"There was some problem while Cloning Git repo : {repo_url} as : {str(e)}") from e
+
+        whl_files = list(Path(target_dir).rglob("*.whl"))
+        if not whl_files:
+            raise ValidationError("No .whl file found in the cloned repository.")
+
+        return str(whl_files[0])
+   
     async def _validate_endpoint(self, endpoint: str, api_key: Optional[str] = None, TEST :bool = False) -> None:
         """
         Validate a remote tool endpoint by checking its format and accessibility.
@@ -414,42 +472,6 @@ class Registry:
             except asyncio.TimeoutError:
                 raise ValidationError(f"Connection to endpoint {endpoint} timed out")
 
-    async def _clone_repo_async(self, repo_url: str, target_dir: str) -> None:
-        """
-        Clone a git repository asynchronously.
-        
-        Args:
-            repo_url: URL of the git repository
-            target_dir: Directory to clone into
-        
-        Raises:
-            ValidationError: If cloning fails
-        """
-        if os.path.exists(target_dir):
-            shutil.rmtree(target_dir)
-        
-        os.makedirs(target_dir, exist_ok=True)
-        
-        process = await asyncio.create_subprocess_exec(
-            'git', 'clone', '--depth=1', repo_url, target_dir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        
-        _ , stderr = await process.communicate()
-        
-        if process.returncode != 0:
-            if os.path.exists(target_dir):
-                shutil.rmtree(target_dir)
-            raise ValidationError(f"Failed to clone repository: {stderr.decode().strip()}")
-        
-        whl_files = list(Path(target_dir).rglob("*.whl"))
-
-        if not whl_files:
-            raise ValidationError("No .whl file found in the cloned repository.")
-
-        return str(whl_files[0])
-   
     async def remove_tools(self, names: list[str]) -> dict[str, bool]:
         """
         Remove multiple tools asynchronously with optimized execution.
