@@ -1,2 +1,2 @@
-# a4agents
-This is a Framework for creating Large scale AI Agents, that can acutally become true IT guys...
+##A4Agents
+Framework for creating Scalable,Distributable, Dynamically Editable AI AGENTs.
